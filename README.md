@@ -9,7 +9,7 @@ _If you use these codes in your research, please cite our manuscript._
 `1_CreatResids.R` : create residuals of gene expression data from MCSA and ADNI.\
 `2_bl_wgcna.R` : blood (MCSA and ADNI) consensus WGCNA analysis.\
 `3_br_wgcna.R` : brain (AMP-AD) consensus WGCNA analysis.\
-`4_nduf_assoc_de.R` : DEG analysis of _NDUFs _in blood and brain cohorts.\
+`4_nduf_assoc_de.R` : DEG analysis of _NDUFs_ in blood and brain cohorts.\
 `5_longitudinal.R` : longitudinal association of _NDUFs_ in MCSA and ADNI.\
 `visualization.R` : create all main and supplementary figures to visualize results.\
 `fns.R` : a list of frequently used functions
