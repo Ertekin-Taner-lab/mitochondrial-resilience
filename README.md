@@ -20,17 +20,17 @@ _If you use these codes in your research, please cite our manuscript._
 `rbt_1_3.R` : This script addresses comment 3 about mediation from reviewer 1.\
 `rbt_1_4_cbx_LM10.Rmd` : This script address comment 4 about cell type proportion from reviewer 1.\
 `rbt_1_5.Rmd` :  This script addresses comment 5 about genetic support from reviewer 1.\
-`rbt_1_5_run_cisQTL_NDUFs_021726.R` : This script is used for running cis-eQTL and addresses comment 5 about genetic support from reviewer 1.\ 
+`rbt_1_5_run_cisQTL_NDUFs_021726.R` : This script is used for running cis-eQTL and addresses comment 5 about genetic support from reviewer 1. 
 `rbt_1_6.R` : This script addresses comment 6 about network robustness from reviewer 1.\
 `rbt_1_7.R` : This script addresses comment 7 about competitive gene testing from reviewer 1.\
 `rbt_1_10_PRSv3.Rmd` : This script addresses comment 10 about genetic risk interaction from reviewer 1.\
-`rbt_1_10.R` : This script addresses comment 10 about genetic risk interaction from reviewer 1. This script in particular runs interaction with _APOE_4 dose.\
+`rbt_1_10.R` : This script addresses comment 10 about genetic risk interaction from reviewer 1. This script in particular runs interaction with APOE4 dose.\
 `rbt_1_11.R` : This script addresses comment 11 about cross-platform harmonization from reviewer 1.\
 `rbt_1_12.R` : This script addresses comment 12 about effect size reporting and forest plots from reviewer 1.\
 `rbt_1_13.R` : This script addresses comment 13 about outlier diagnostics from reviewer 1.\
 `rbt_2_1.Rmd` : This script addresses comment 1 about analysis correcting for diagnosis from Reviewer 2.\
 `rbt_2_1_3_BF_TM.Rmd` : This script addresses comment 1 about number of resilience per diagnosis from Reviewer 2. This script also addresses comment B and F from Reviewer 3 regarding prediction on resilience status.\
-`rbt_2_3.Rmd` : This script addresses comment 3 about _APOE_4 sensitivity analysis Reviewer 2.\
+`rbt_2_3.Rmd` : This script addresses comment 3 about APOE4 sensitivity analysis Reviewer 2.\
 `rbt_2_9.R` : This script addresses comment 9 about hippocampal volume harmonization from reviewer 2.
 
 **rebuttal_2nd**: Scripts generated in response to the second round of reviewers' comments.\
