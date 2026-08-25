@@ -1,0 +1,540 @@
+---
+title: "rbt_2_1"
+output: html_document
+date: "2026-03-04"
+---
+
+Author: Wei (Adelyn) Tsai; [tsai.wei\@mayo.edu](mailto:tsai.wei@mayo.edu){.email} If you are using this script, please cite our study This script addresses comment 1 about analysis correcting for diagnosis from Reviewer 2. 
+
+# Libraries and directories
+
+```{r}
+suppressPackageStartupMessages(library(tidyverse)) #v2.0.0
+suppressPackageStartupMessages(library(openxlsx)) #v4.2.8
+suppressPackageStartupMessages(library(patchwork)) #v1.3.2
+suppressPackageStartupMessages(library(broom)) #v1.0.12
+suppressPackageStartupMessages(library(pbapply)) #v1.7
+suppressPackageStartupMessages(library(ggpubr)) #v0.6.3
+
+
+set.seed(123)
+
+# list of input/output directories
+indir <- "./indir"
+residir <- "./outdir/resids"
+blwgcna_dir <- "./outdir/bl_wgcna"
+nduf_assoc_dir <- "./outdir/nduf_assoc_de"
+
+# output directory
+outdir <- "./Rebuttal/outdir"
+
+source("./Codes/fns.R") #source a list of frequently used functions
+
+load(paste0(outdir, "/2_1_3_BF/inputdf.RData")) # this is prepared from rbt_2_1_3_BF_TM.Rmd
+nduf_bb <- read.csv(paste0(nduf_assoc_dir, "/nduf_bb.csv")) #generated in 4_nduf_assoc_de.R
+```
+
+# Define Functions
+Prepare a linear function that allows me to conveniently run regression adjusting for diagnosis status or stratified by diagnosis status
+
+```{r function}
+linear_fn_new <- function(data_df,
+                     XVars,
+                     YVars, 
+                     adj_stratify_covs, 
+                     all_status,
+                     base_covs,
+                     base_covs_for_HV,
+                     stratified = F){
+  run_assoc <- function(xvar, yvar, adj_stratify_covar, status){
+    
+    df_use <- data_df
+    # if stratified is True, filter the data to keep only certain status
+    if (stratified){df_use <- df_use %>% filter(.data[[adj_stratify_covar]] == status)}
+    # define the covariates
+    if (xvar %in% c("Memory", "LMDR")){
+      covars <- if (stratified) {base_covs} else {c(base_covs, adj_stratify_covar)}
+      } 
+    else if (xvar == "HippVol"){
+      covars <- if (stratified) {base_covs_for_HV} else {c(base_covs_for_HV, adj_stratify_covar)}
+      } 
+    # run regression
+    m <- lm(paste0(yvar, " ~ ", xvar, " + ", paste0(covars, collapse = " + ")), data = df_use)
+    res_df <- broom::tidy(m, conf.int = T)
+    
+    # save results
+    tbl <- tibble(
+      Model = list(m),
+      SummDf = list(res_df)
+    )
+    return(tbl)
+  }
+  
+  # Run for all combinations
+  results <- if (!stratified) {
+    expand.grid(
+      X = XVars,
+      Y = YVars,
+      AdjStratify_Covar = adj_stratify_covs,
+      stringsAsFactors = FALSE
+      ) %>% 
+      mutate(result = pmap(list(X, Y, AdjStratify_Covar),
+                         ~ run_assoc(..1, ..2, ..3))) %>%
+      unnest(result)
+  } 
+  else {
+    expand.grid(
+      X = XVars,
+      Y = YVars,
+      AdjStratify_Covar = adj_stratify_covs,
+      Stratify_Status = all_status,
+      stringsAsFactors = FALSE
+      ) %>% 
+      filter(
+        (AdjStratify_Covar == "LastDx_binary" & Stratify_Status %in% c("Control", "Case"))
+        ) %>% 
+    mutate(result = pmap(list(X, Y, AdjStratify_Covar, Stratify_Status),
+                         ~ run_assoc(..1, ..2, ..3, ..4))) %>%
+    unnest(result)
+  }
+  
+  return(results)
+}
+```
+
+Run regression adjusting for last diagnosis
+```{r regression - adjust for dx}
+mcsa_m3_dxadj <- linear_fn_new(data_df = mcsa_input, 
+                        XVars = c("Memory", "LMDR", "HippVol"),
+                        YVars = "ME3",
+                        adj_stratify_covs = c("LastDx_binary"),
+                        all_status = NULL,
+                        base_covs = c("Age", "Sex", "Educ"),
+                        base_covs_for_HV = c("Age", "Sex", "Educ", "Hipp_ICV"),
+                        stratified = F)
+mcsa_nduf_dxadj <- linear_fn_new(data_df = mcsa_input, 
+                        XVars = c("Memory", "LMDR", "HippVol"),
+                        YVars = nduf_bb$gene_name,
+                        adj_stratify_covs = c("LastDx_binary"),
+                        all_status = NULL,
+                        base_covs = c("Age", "Sex", "Educ", "RIN", "PAXgene_flowcell", "PAXgene_Batch"),
+                        base_covs_for_HV = c("Age", "Sex", "Educ", "Hipp_ICV", "RIN", "PAXgene_flowcell", "PAXgene_Batch"),
+                        stratified = F)
+mcsa_dxadj <- rbind(mcsa_m3_dxadj, mcsa_nduf_dxadj)
+rm(mcsa_m3_dxadj, mcsa_nduf_dxadj)
+
+adni_m3_dxadj <- linear_fn_new(data_df = adni_input, 
+                        XVars = c("Memory", "LMDR", "HippVol"),
+                        YVars = "ME3",
+                        adj_stratify_covs = c("LastDx_binary"),
+                        all_status = NULL,
+                        base_covs = c("Age", "Sex", "Educ"),
+                        base_covs_for_HV = c("Age", "Sex", "Educ", "Hipp_ICV", "Mag_HippICV"),
+                        stratified = F)
+adni_nduf_dxadj <- linear_fn_new(data_df = adni_input, 
+                        XVars = c("Memory", "LMDR", "HippVol"),
+                        YVars = nduf_bb$gene_name,
+                        adj_stratify_covs = c("LastDx_binary"),
+                        all_status = NULL,
+                        base_covs = c("Age", "Sex", "Educ", "RIN", "AffyPlate.meanREE", "SITE.meanREE"),
+                        base_covs_for_HV = c("Age", "Sex", "Educ", "Hipp_ICV",  "Mag_HippICV", "RIN", "AffyPlate.meanREE", "SITE.meanREE"),
+                        stratified = F)
+adni_dxadj <- rbind(adni_m3_dxadj, adni_nduf_dxadj)
+rm(adni_m3_dxadj, adni_nduf_dxadj)
+# organize the dataframe
+dxadj_summ <- mcsa_dxadj %>% 
+  mutate(Cohort = "MCSA") %>% 
+  dplyr::select(Cohort, X, Y, AdjStratify_Covar, SummDf) %>% 
+  unnest(SummDf) %>% 
+  rbind(
+    adni_dxadj %>% 
+  mutate(Cohort = "ADNI") %>% 
+  dplyr::select(Cohort, X, Y, AdjStratify_Covar, SummDf) %>% 
+  unnest(SummDf)
+  ) %>% 
+  filter(X == term) %>% 
+  group_by(Cohort, X) %>% 
+  mutate(q.value = p.adjust(p.value, method = "fdr"), .after = "p.value") 
+```
+Run regression stratifying for last diagnosis
+```{r regression - stratified for dx}
+mcsa_m3_stratified <-  linear_fn_new(data_df = mcsa_input, 
+                           XVars = c("Memory", "LMDR", "HippVol"),
+                           YVars = "ME3",
+                           adj_stratify_covs = c("LastDx_binary"),
+                           all_status = c("Case", "Control"),
+                           base_covs = c("Age", "Sex", "Educ"),
+                           base_covs_for_HV = c("Age", "Sex", "Educ", "Hipp_ICV"),
+                           stratified = T)
+mcsa_nduf_stratified <-  linear_fn_new(data_df = mcsa_input, 
+                           XVars = c("Memory", "LMDR", "HippVol"),
+                           YVars = nduf_bb$gene_name,
+                           adj_stratify_covs = c("LastDx_binary"),
+                           all_status = c("Case", "Control"),
+                           base_covs = c("Age", "Sex", "Educ", "RIN", "PAXgene_flowcell", "PAXgene_Batch"),
+                           base_covs_for_HV = c("Age", "Sex", "Educ", "Hipp_ICV", "RIN", "PAXgene_flowcell", "PAXgene_Batch"),
+                           stratified = T)
+mcsa_stratified = rbind(mcsa_m3_stratified, mcsa_nduf_stratified)
+rm(mcsa_m3_stratified, mcsa_nduf_stratified)
+
+adni_m3_stratified <-  linear_fn_new(data_df = adni_input, 
+                           XVars = c("Memory", "LMDR", "HippVol"),
+                           YVars = "ME3",
+                           adj_stratify_covs = c("LastDx_binary"),
+                           all_status = c("Case", "Control"),
+                           base_covs = c("Age", "Sex", "Educ"),
+                           base_covs_for_HV = c("Age", "Sex", "Educ", "Hipp_ICV", "Mag_HippICV"),
+                           stratified = T)
+adni_nduf_stratified <-  linear_fn_new(data_df = adni_input, 
+                           XVars = c("Memory", "LMDR", "HippVol"),
+                           YVars = nduf_bb$gene_name,
+                           adj_stratify_covs = c("LastDx_binary"),
+                           all_status = c("Case", "Control"),
+                           base_covs = c("Age", "Sex", "Educ", "RIN", "AffyPlate.meanREE", "SITE.meanREE"),
+                           base_covs_for_HV = c("Age", "Sex", "Educ", "Hipp_ICV",  "Mag_HippICV", "RIN", "AffyPlate.meanREE", "SITE.meanREE"),
+                           stratified = T)
+adni_stratified = rbind(adni_m3_stratified, adni_nduf_stratified)
+rm(adni_m3_stratified, adni_nduf_stratified)
+
+stratified_summ <- mcsa_stratified %>% 
+  mutate(Cohort = "MCSA") %>% 
+  dplyr::select(Cohort, X, Y, AdjStratify_Covar, Stratify_Status, SummDf) %>% 
+  unnest(SummDf) %>% 
+  rbind(
+    adni_stratified %>% 
+      mutate(Cohort = "ADNI") %>% 
+      dplyr::select(Cohort, X, Y, AdjStratify_Covar, Stratify_Status, SummDf) %>% 
+      unnest(SummDf)
+  ) %>% 
+  filter(X == term) %>% 
+  group_by(Cohort, X) %>% 
+  mutate(q.value = p.adjust(p.value, method = "fdr"), .after = "p.value") 
+```
+
+
+
+
+```{r meta-analysis for dx adjusted regression}
+# prepare meta-analysis input dataframe
+mcsa_dxadj_df <- dxadj_summ %>% filter(Cohort == "MCSA") %>% dplyr::select(-Cohort)
+adni_dxadj_df <- dxadj_summ %>% filter(Cohort == "ADNI") %>% dplyr::select(-Cohort)
+
+meta_df = inner_join(mcsa_dxadj_df, adni_dxadj_df, by = c("X","Y", "AdjStratify_Covar", "term"), suffix = c("_MCSA", "_ADNI")) %>% 
+  mutate(rn = paste0(X, "_", Y, "_", AdjStratify_Covar)) %>% 
+  column_to_rownames("rn")
+
+# this indicates column indices corresponding to estimates and standard error of MCSA and ADNI
+eff_idx1 = which(colnames(meta_df) == "estimate_MCSA")
+eff_idx2 = which(colnames(meta_df) == "estimate_ADNI")
+err_idx1 = which(colnames(meta_df) == "std.error_MCSA")
+err_idx2 = which(colnames(meta_df) == "std.error_ADNI")
+
+# run meta-analysis using the function meta_gen_fn defined above
+meta_raw = meta_df %>% pbapply(1, meta_gen_fn, eff_idx1 = eff_idx1, eff_idx2 = eff_idx2, err_idx1 = err_idx1, err_idx2 = err_idx2)
+
+# Get all fixed-effect results
+fix_res = meta_raw %>%
+  pbsapply(function(x) x$fixed) %>%
+  t() %>%
+  as.data.frame() %>%
+  rename_with(~paste0(.x, "_fixed")) %>%
+  rownames_to_column(var = "rn") %>%
+  mutate_all(.funs = ~unlist(.x)) %>% 
+  mutate_all(.funs = ~unname(.x))
+
+# Get all random-effect results
+rand_res = meta_raw %>%
+  pbsapply(function(x) x$random) %>%
+  t() %>%
+  data.frame() %>%
+  rename_with(~paste0(.x, "_random")) %>%
+  rownames_to_column(var = "rn") %>%
+  mutate_all(.funs = ~unlist(.x)) %>%
+  mutate_all(.funs = ~unname(.x))
+
+# Get heterogenity meassurments Q, I2, tau2
+het_res = meta_raw %>%
+  map(~.x[c("Q","df.Q","pval.Q","I2", "lower.I2", "upper.I2", "tau2", "se.tau2", "H", "lower.H", "upper.H")]) %>%
+  bind_rows(.id = "rn")
+
+# Join the results to the original regression coeffcients
+meta_df = meta_df %>%
+  rownames_to_column(var = "rn") %>% 
+  inner_join(fix_res) %>%
+  inner_join(rand_res) %>% 
+  rename_with(~sub("^TE", "beta", .x), everything()) %>%
+  rename_with(~sub("^seTE", "se", .x), everything()) %>%
+  inner_join(het_res, by = "rn")
+
+# final meta-analyze dataframe, including adjusting for multiple test correction, determining meta-analyzed beta, p and q-values based on heterogeneity measures I2
+meta_dxadj = meta_df %>%
+  group_by(X) %>%
+  mutate(q_random = p.adjust(p_random, method = "fdr"),
+         q_fixed = p.adjust(p_fixed, method = "fdr"),
+         model_meta = ifelse(I2 < 0.25, "Fixed", "Random"),
+         beta_meta = ifelse(model_meta =="Fixed", beta_fixed, beta_random),
+         se_meta = ifelse(model_meta =="Fixed", se_fixed, se_random),
+         p_meta = ifelse(model_meta =="Fixed", p_fixed, p_random),
+         q_meta = ifelse(model_meta =="Fixed", q_fixed, q_random),
+         CI_L_meta = ifelse(model_meta == "Fixed", lower_fixed, lower_random),
+         CI_H_meta = ifelse(model_meta =="Fixed", upper_fixed, upper_random)
+         ) %>%
+  dplyr::select(-c(ends_with("_random"), ends_with("_fixed"), starts_with("Cohort_"))) %>% 
+  dplyr::select(-rn, -term)
+
+rm(meta_df, meta_raw, fix_res, rand_res, het_res, eff_idx1, eff_idx2, err_idx1, err_idx2)
+```
+
+```{r meta-analysis for dx stratified regression}
+# prepare meta-analysis input dataframe
+mcsa_stratified_df <- stratified_summ %>% filter(Cohort == "MCSA") %>% dplyr::select(-Cohort)
+adni_stratified_df <- stratified_summ %>% filter(Cohort == "ADNI") %>% dplyr::select(-Cohort)
+
+meta_df = inner_join(mcsa_stratified_df, adni_stratified_df, by = c("X","Y", "AdjStratify_Covar", "Stratify_Status", "term"), suffix = c("_MCSA", "_ADNI")) %>% 
+  mutate(rn = paste0(X, "_", Y, "_", AdjStratify_Covar, "_", Stratify_Status)) %>% 
+  column_to_rownames("rn")
+
+# this indicates column indices corresponding to estimates and standard error of MCSA and ADNI
+eff_idx1 = which(colnames(meta_df) == "estimate_MCSA")
+eff_idx2 = which(colnames(meta_df) == "estimate_ADNI")
+err_idx1 = which(colnames(meta_df) == "std.error_MCSA")
+err_idx2 = which(colnames(meta_df) == "std.error_ADNI")
+
+# run meta-analysis using the function meta_gen_fn defined above
+meta_raw = meta_df %>% pbapply(1, meta_gen_fn, eff_idx1 = eff_idx1, eff_idx2 = eff_idx2, err_idx1 = err_idx1, err_idx2 = err_idx2)
+
+# Get all fixed-effect results
+fix_res = meta_raw %>%
+  pbsapply(function(x) x$fixed) %>%
+  t() %>%
+  as.data.frame() %>%
+  rename_with(~paste0(.x, "_fixed")) %>%
+  rownames_to_column(var = "rn") %>%
+  mutate_all(.funs = ~unlist(.x)) %>% 
+  mutate_all(.funs = ~unname(.x))
+
+# Get all random-effect results
+rand_res = meta_raw %>%
+  pbsapply(function(x) x$random) %>%
+  t() %>%
+  data.frame() %>%
+  rename_with(~paste0(.x, "_random")) %>%
+  rownames_to_column(var = "rn") %>%
+  mutate_all(.funs = ~unlist(.x)) %>%
+  mutate_all(.funs = ~unname(.x))
+
+# Get heterogenity meassurments Q, I2, tau2
+het_res = meta_raw %>%
+  map(~.x[c("Q","df.Q","pval.Q","I2", "lower.I2", "upper.I2", "tau2", "se.tau2", "H", "lower.H", "upper.H")]) %>%
+  bind_rows(.id = "rn")
+
+# Join the results to the original regression coeffcients
+meta_df = meta_df %>%
+  rownames_to_column(var = "rn") %>% 
+  inner_join(fix_res) %>%
+  inner_join(rand_res) %>% 
+  rename_with(~sub("^TE", "beta", .x), everything()) %>%
+  rename_with(~sub("^seTE", "se", .x), everything()) %>%
+  inner_join(het_res, by = "rn")
+
+# final meta-analyze dataframe, including adjusting for multiple test correction, determining meta-analyzed beta, p and q-values based on heterogeneity measures I2
+meta_stratified = meta_df %>%
+  group_by(X, Stratify_Status) %>%
+  mutate(q_random = p.adjust(p_random, method = "fdr"),
+         q_fixed = p.adjust(p_fixed, method = "fdr"),
+         model_meta = ifelse(I2 < 0.25, "Fixed", "Random"),
+         beta_meta = ifelse(model_meta =="Fixed", beta_fixed, beta_random),
+         se_meta = ifelse(model_meta =="Fixed", se_fixed, se_random),
+         p_meta = ifelse(model_meta =="Fixed", p_fixed, p_random),
+         q_meta = ifelse(model_meta =="Fixed", q_fixed, q_random),
+         CI_L_meta = ifelse(model_meta == "Fixed", lower_fixed, lower_random),
+         CI_H_meta = ifelse(model_meta =="Fixed", upper_fixed, upper_random)
+         ) %>%
+  dplyr::select(-c(ends_with("_random"), ends_with("_fixed"), starts_with("Cohort_"))) %>% 
+  dplyr::select(-rn, -term)
+
+rm(meta_df, meta_raw, fix_res, rand_res, het_res, eff_idx1, eff_idx2, err_idx1, err_idx2)
+```
+
+
+```{r save results - dx only}
+save(mcsa_dxadj, mcsa_stratified, adni_dxadj, adni_stratified, file = paste0(outdir, "/2_1/DXAdj_Stratified_Regression.RData"))
+
+write.xlsx(list(
+  "DXAdj" = dxadj_summ,
+  "Stratified" = stratified_summ,
+  "DXAdj_Meta" = meta_dxadj,
+  "Stratified_Meta" = meta_stratified
+),
+paste0(outdir, "/2_1/DXAdj_Stratified_Regression_summ.xlsx"))
+```
+
+# Plot regression results
+
+
+```{r plot results}
+# organize dataframe to plot the results adjusting for dx
+plot_df <- meta_dxadj %>%
+  dplyr::select(X:estimate_MCSA, p.value_MCSA:q.value_MCSA, estimate_ADNI, p.value_ADNI:q.value_ADNI, beta_meta, p_meta:q_meta) %>% 
+  dplyr::rename(
+    estimate_meta = beta_meta,
+    p.value_meta = p_meta,
+    q.value_meta = q_meta
+    ) %>%
+  pivot_longer(
+    cols = ends_with(c("_MCSA" , "_ADNI" , "_meta")),
+    names_to = "name",
+    values_to = "value"
+  ) %>%
+  separate(
+    name,
+    into = c("stat", "Cohort"),
+    sep = "_(?=[^_]+$)",
+    extra = "merge"
+  ) %>%
+  pivot_wider(
+    names_from = stat,
+    values_from = value
+  ) %>% 
+  mutate(X=factor(X, levels=c("Memory", "LMDR", "HippVol")),
+         Y = ifelse(Y == "ME3", "Bl_M3", Y),
+         Cohort = ifelse(Cohort=="meta", "Meta-analyzed", Cohort),
+         Cohort = factor(Cohort, levels=c("MCSA", "ADNI","Meta-analyzed")),
+         lbl = if_else(q.value<0.05, "✱", ""), 
+         lbl = if_else(p.value<0.05 & q.value>0.05,"Δ", lbl)
+         )
+
+# organize dataframe to plot the results stratified by dx
+plot_df2 <- meta_stratified %>%
+  dplyr::select(X:estimate_MCSA, p.value_MCSA:q.value_MCSA, estimate_ADNI, p.value_ADNI:q.value_ADNI, beta_meta, p_meta:q_meta) %>% 
+  dplyr::rename(
+    estimate_meta = beta_meta,
+    p.value_meta = p_meta,
+    q.value_meta = q_meta
+    ) %>%
+  pivot_longer(
+    cols = ends_with(c("_MCSA" , "_ADNI" , "_meta")),
+    names_to = "name",
+    values_to = "value"
+  ) %>%
+  separate(
+    name,
+    into = c("stat", "Cohort"),
+    sep = "_(?=[^_]+$)",
+    extra = "merge"
+  ) %>%
+  pivot_wider(
+    names_from = stat,
+    values_from = value
+  ) %>% 
+  filter(Stratify_Status == "Control") %>% 
+  mutate(X=factor(X, levels=c("Memory", "LMDR", "HippVol")),
+         Y = ifelse(Y == "ME3", "Bl_M3", Y),
+         Cohort = ifelse(Cohort=="meta", "Meta-analyzed", Cohort),
+         Cohort = factor(Cohort, levels=c("MCSA", "ADNI","Meta-analyzed")),
+         lbl = if_else(q.value<0.05, "✱", ""), 
+         lbl = if_else(p.value<0.05 & q.value>0.05,"Δ", lbl)
+         )
+
+# organize a dataframe to plot the correlation between estimates 
+## acquire estimates before adjusting for DX
+metr <- read.csv(paste0(blwgcna_dir, "/module_trait.csv")) # this is created from 2_bl_wgcna.R
+nduf_assoc <- read.csv(paste0(nduf_assoc_dir, "/Bl_Assoc.csv")) # this is created from 4_nduf_assoc_de.R
+
+og_cs <- metr %>% 
+  dplyr::select(Module, Pheno, estimate_MCSA, estimate_ADNI, beta_meta) %>% 
+  filter(Module == "ME3" & Pheno %in% c("Memory", "LMDR", "HippVol")) %>% 
+  rename(NDUF = Module, Phenotype = Pheno) %>% 
+  rbind(
+    nduf_assoc %>% 
+      dplyr::select(gene_name, Phenotype, estimate_MCSA, estimate_ADNI, beta_meta) %>% 
+      rename(NDUF = gene_name)
+  ) %>% 
+  dplyr::rename(estimate_meta = beta_meta) %>%
+  pivot_longer(
+    cols = ends_with(c("_MCSA" , "_ADNI" , "_meta")),
+    names_to = "name",
+    values_to = "value"
+  ) %>%
+  separate(
+    name,
+    into = c("stat", "Cohort"),
+    sep = "_(?=[^_]+$)",
+    extra = "merge"
+  ) %>%
+  pivot_wider(
+    names_from = stat,
+    values_from = value
+  ) %>% 
+  mutate(Cohort = ifelse(Cohort == "meta", "Meta-analyzed", Cohort),
+         NDUF = ifelse(NDUF == "ME3", "Bl_M3", NDUF))
+plot_df3 <- plot_df %>% 
+  dplyr::select(X, Y, Cohort, estimate) %>% 
+  dplyr::rename(est_DXAdjusted = estimate) %>% 
+  left_join(
+    og_cs %>% dplyr::rename(est_NoDXAdjusted = estimate),
+    by= c("X" = "Phenotype", "Y" = "NDUF", "Cohort")
+  ) %>% 
+  mutate(Cohort = factor(Cohort, levels = c("MCSA", "ADNI", "Meta-analyzed")),
+         X=factor(X, levels=c("Memory", "LMDR", "HippVol")))
+
+cairo_pdf(paste0(outdir, "/2_1/DXAdj_Stratified_Regression.pdf"), width = 19.5, height = 5.5)
+plot_df %>% 
+  ggplot(aes(x=Y, y=Cohort)) +
+  geom_point(shape=21, color="black", aes(fill=estimate, size = -log(p.value))) +
+  geom_text(aes(label=lbl), size=5/.pt) +
+  scale_fill_gradient2(low = "blue", high = "red", mid = "white", midpoint = 0, name=expression(beta))+
+  #scale_size_continuous(range = c(2,10)) + 
+  labs(
+    title = "Last clinical diagnosis included as a covariate",
+    x = "",
+    caption = "Δ:P<0.05; ✱: q<0.05") +
+  facet_grid(X~ ., space = "free", scales = "free") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(face = "italic", angle = 30, hjust = 1),
+        axis.title.y = element_blank(),
+        strip.background = element_rect(colour = "black"),
+        legend.key.size = unit(0.1,"in"),
+        text = element_text(family = "ArialMT"),
+        plot.title = element_text(hjust = .5)) + # this is extended data fig.7b
+plot_df3 %>%
+  filter(Y != "Bl_M3") %>%
+  ggplot(aes(x = est_NoDXAdjusted, y = est_DXAdjusted)) +
+  geom_point() + 
+  geom_smooth(method = "lm") +
+  geom_abline(intercept = 0, slope = 1, color = "red", linetype = "dashed") +
+  facet_grid(Cohort ~ X, scales = "free") +
+  # Add correlation coefficient (r) and p-value
+  stat_cor(
+    method = "pearson",
+    label.x.npc = "left",   # position (can be "left", "right", etc.)
+    label.y.npc = "top",
+    label.sep = "\n"
+  ) +
+  theme_bw() + # this is extended data fig.7c
+plot_df2 %>% 
+  filter(Stratify_Status == "Control") %>% 
+  ggplot(aes(x=Y, y=Cohort)) +
+  geom_point(shape=21, color="black", aes(fill=estimate, size = -log(p.value))) +
+  geom_text(aes(label=lbl), size=5/.pt) +
+  scale_fill_gradient2(low = "blue", high = "red", mid = "white", midpoint = 0, name=expression(beta))+
+  #scale_size_continuous(range = c(2,10)) + 
+  labs(
+    title = "Stratified by DX",
+    subtitle = "Only show results with CN",
+    x = "",
+    caption = "Δ:P<0.05; ✱:q<0.05") +
+  facet_grid(X ~. , space = "free", scales = "free") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(face = "italic", angle = 30, hjust = 1),
+        axis.title.y = element_blank(),
+        strip.background = element_rect(colour = "black"),
+        legend.key.size = unit(0.1,"in"),
+        text = element_text(family = "ArialMT"),
+        plot.title = element_text(hjust = .5),
+        plot.subtitle = element_text(hjust = .5)) # this is extended data fig.7d
+dev.off()
+```
+
+
+

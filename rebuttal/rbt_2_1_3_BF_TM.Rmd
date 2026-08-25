@@ -1,0 +1,1035 @@
+---
+title: "rbt_2_1_3_BF_resid"
+output: html_document
+date: "2026-01-30"
+---
+
+Author: Wei (Adelyn) Tsai; [tsai.wei\@mayo.edu](mailto:tsai.wei@mayo.edu){.email} If you are using this script, please cite our study This script addresses comment 1 about number of resilience per diagnosis from Reviewer 2. This script also addresses comment B and F from Reviewer 3 regarding prediction on resilience status
+
+Please not that prediction results are updated based on comment from 2nd rebuttal. Please refer to rebuttal_2nd/rbt_1_6.Rmd for updated results.
+
+# Libraries and directories
+
+```{r}
+suppressPackageStartupMessages(library(tidyverse)) #v2.0.0
+suppressPackageStartupMessages(library(tidymodels)) #v1.4.1
+suppressPackageStartupMessages(library(openxlsx)) #v4.2.8
+suppressPackageStartupMessages(library(ggcorrplot)) #v0.1.4.1
+suppressPackageStartupMessages(library(patchwork)) #v1.3.2
+suppressPackageStartupMessages(library(ggfortify)) #v0.4.19
+suppressPackageStartupMessages(library(broom)) #v1.0.12
+suppressPackageStartupMessages(library(pbapply)) #v1.7
+
+
+set.seed(123)
+
+# list of input/output directories
+indir <- "./indir"
+residir <- "./outdir/resids"
+blwgcna_dir <- "./outdir/bl_wgcna"
+nduf_assoc_dir <- "./outdir/nduf_assoc_de"
+
+# output directory
+outdir <- "./Rebuttal/outdir"
+
+source("./Codes/fns.R") #source a list of frequently used functions
+```
+
+# Calculate CR using residuals
+
+```{r}
+# load needed files
+comTrait <- readRDS(paste0(indir,"/comTrait.rds")) # a file having cross-sectional endophenotypes for MCSA (from row 1-105) and ADNI (from row 106-196); row names are donorID
+
+## we extracted Abeta centiloids for calculating cognitive resilience based on Abeta levels
+## we used Abeta centiloid two years from visit date for blood collection
+
+mcsa_pet = readxl::read_excel(paste0(indir, "/MCSA_Updated_PET_data.xlsx")) # a file with PET imaging data from MCSA; relevant PiB columns including:
+# pibdate: date of PiB
+# pibmanufacturer: manufacturer of PiB tracer
+# pib_suvr
+# pib_centiloid
+# abnormal_pib = cutoff is 25 Centiloid (1.52 SUVR) for positivity
+adni_pet <- read_csv(paste0(indir, "/ADSP_PHC_PET_Amyloid_Simple_04Nov2025.csv")) # file with PET imaging data from ADNI; effort of ADSP harmonization; relevant AV45 columns include:
+# PHC_SCANDATE: PET scan date
+# PHC_TRACER
+# PHC_QC_IMAGE: QC of image quality
+# PHC_QC_TIMING: QC of imaging acquisition time
+# PHC_CL_FAIL: projected centiloid values for images that failed QC_TIMING
+# PHC_CENTILOIDS
+# PHC_AMYLOID_STATUS: cutoff is 25 centiloid for positivity
+
+
+mcsa_ab <- mcsa_pet %>% 
+  mutate(SubjectID = as.character(ptnum)) %>% 
+  dplyr::select(SubjectID, pibdate, pibmanufacturer, pib_suvr, pib_centiloid, abnormal_pib) %>% 
+  inner_join(comTrait %>% rownames_to_column("SubjectID") %>% dplyr::select(SubjectID, PaxDt)) %>% #PaxDt = date of blood collection visit
+  mutate(daydiff = abs(difftime(PaxDt, pibdate))) %>% 
+  group_by(SubjectID) %>% 
+  arrange(daydiff) %>% 
+  slice_head() #98 people
+
+adni_ab <- adni_pet %>% 
+  dplyr::select(PTID, PHC_SCANDATE, PHC_TRACER, PHC_QC_IMAGE, PHC_QC_TIMING, PHC_CENTILOIDS, PHC_CL_FAIL, PHC_AMYLOID_STATUS) %>% 
+  dplyr::rename(SubjectID = PTID) %>% 
+  inner_join(comTrait %>% rownames_to_column("SubjectID") %>% dplyr::select(SubjectID, PaxDt)) %>% 
+  mutate(daydiff = abs(difftime(PaxDt, PHC_SCANDATE, units = "days"))) %>% 
+  group_by(SubjectID) %>% 
+  arrange(daydiff) %>% 
+  slice_head() # 80 people; all images passed QC
+
+# combine data of Abeta with covariates (age, sex, education, APOE4) and cognition (memory/LMDR)
+mcsa_df <- comTrait[1:105,] %>% 
+  rownames_to_column("SubjectID") %>% 
+  dplyr::select(SubjectID, Sex, Educ, Age, APOE4, Memory, LMDR, HippVol, Hipp_ICV, Mag_HippICV, PaxDx, LastDx, PaxDx_binary, LastDx_binary) %>%
+  mutate(SubjectID = paste0("s_", SubjectID)) %>% 
+  left_join(mcsa_ab %>% mutate(SubjectID = paste0("s_", SubjectID)))
+rownames(mcsa_df) <- mcsa_df$SubjectID
+
+adni_df <- comTrait[106:196,] %>% 
+  rownames_to_column("SubjectID") %>% 
+  dplyr::select(SubjectID, Sex, Educ, Age, APOE4, Memory, LMDR, HippVol, Hipp_ICV, Mag_HippICV, PaxDx, LastDx, PaxDx_binary, LastDx_binary) %>%
+  left_join(adni_ab)
+rownames(adni_df) <- adni_df$SubjectID
+
+save(mcsa_df, adni_df, file = paste0(outdir, "/2_1_3_BF/MCSA_ADNI_s196_DemoDf.RData"))
+
+
+# establish CR calculation functions
+update_geom_defaults("text", list(size = 5/.pt)) # update the default text size
+cr_fn <- function(df, x, y, covars){
+  print(paste0(x, "; ", y))
+  fit = lm(paste0(y, " ~ ", paste0(c(x, covars), collapse = " + ")), data = df)
+  Statdf <- augment(fit) %>% dplyr::rename(SubjectID = .rownames)
+  CRdf <- Statdf %>% 
+    dplyr::select(SubjectID, .resid, Age, Sex, Educ, APOE4) %>% 
+    dplyr::rename(CR = .resid) %>% # CR = residuals of the models
+    mutate(Resilience = if_else(CR > 0, "Resilient", "Non-resilient"),
+           Resilience = factor(Resilience, levels = c("Non-resilient", "Resilient"))) # Resilience = resilience status
+  # diagnose_p is to check whether the models meet the assumption of linear regression
+  diagnose_p <- autoplot(fit) + labs(subtitle = paste0(y, " ~ ", paste0(c(x, covars), collapse = " + "))) + theme(text = element_text(size = 6.5))
+  # scatter plot plotting the correlation between dependent and independent variables
+  scatter_p <- df %>% 
+    ggplot(aes_string(x = x, y = y)) +
+    geom_point() +
+    geom_smooth(method = "lm") +
+    labs(subtitle = paste0(y, " ~ ", paste0(c(x, covars), collapse = " + "))) +
+    theme_classic(base_size = 6.5)
+  
+  result <- tibble(
+    X = x,
+    Y = y,
+    Model = list(fit),
+    Statdf = list(Statdf),
+    CRdf = list(CRdf),
+    Dx_P = list(diagnose_p),
+    Scatter_P = list(scatter_p)
+  )
+  return(result)
+}
+
+mcsa_cr_2yrs <- rbind(
+  cr_fn(df = subset(mcsa_df, daydiff<730), x = "pib_centiloid", y = "Memory", covars = c("Age", "Sex", "Educ", "APOE4", "daydiff")), # Y = Memory, regressing on centiloids and risk factors and demographics
+  cr_fn(df = subset(mcsa_df, daydiff<730), x = "pib_centiloid", y = "LMDR", covars = c("Age", "Sex", "Educ", "APOE4", "daydiff")), # Y = LMDR, regressing on centiloids and risk factors and demographics
+  cr_fn(df = mcsa_df, x = "Age", y = "Memory", covars = c("Sex", "Educ", "APOE4")), # Y = Memory, regressing on risk factors and demographics
+  cr_fn(df = mcsa_df, x = "Age", y = "LMDR", covars = c("Sex", "Educ", "APOE4")) # Y = LMDR, regressing on risk factors and demographics
+)
+adni_cr_2yrs <- rbind(
+  cr_fn(df = subset(adni_df, daydiff<730), x = "PHC_CENTILOIDS", y = "Memory", covars = c("Age", "Sex", "Educ", "APOE4", "daydiff")), # Y = Memory, regressing on centiloids and risk factors and demographics
+  cr_fn(df = subset(adni_df, daydiff<730), x = "PHC_CENTILOIDS", y = "LMDR", covars = c("Age", "Sex", "Educ", "APOE4", "daydiff")), # Y = LMDR, regressing on centiloids and risk factors and demographics
+  cr_fn(df = adni_df, x = "Age", y = "Memory", covars = c("Sex", "Educ", "APOE4")), # Y = Memory, regressing on risk factors and demographics
+  cr_fn(df = adni_df, x = "Age", y = "LMDR", covars = c("Sex", "Educ", "APOE4")) # Y = LMDR, regressing on risk factors and demographics
+)
+#save
+save(mcsa_cr_2yrs, adni_cr_2yrs, file = paste0(outdir, "/2_1_3_BF/CRlast_2yrs.RData"))
+
+
+# also save a dataframe for organized from the calculated residuals
+mcsa_CRdf_2yrs <- bind_rows(
+  mcsa_cr_2yrs %>% dplyr::select(X, Y, CRdf) %>% 
+    unnest(CRdf)
+) %>% 
+  dplyr::select(X, Y, SubjectID, CR, Resilience)
+adni_CRdf_2yrs <- bind_rows(
+  adni_cr_2yrs %>% dplyr::select(X, Y, CRdf) %>% 
+    unnest(CRdf)
+) %>% 
+  dplyr::select(X, Y, SubjectID, CR, Resilience)
+
+# organize the cognitive resilience status dataframe
+mcsa_CRdf_2yrs <- mcsa_CRdf_2yrs %>% 
+  filter(X == "Age" & Y == "Memory") %>% 
+  dplyr::rename(CR_X.Age_Y.Mem = CR, Res_X.Age_Y.Mem = Resilience) %>% 
+  dplyr::select(-X, -Y) %>% #has to start with scores calculating without centiloid first because there're more people in this model, so no people will be lost through left_join later
+  left_join(
+    mcsa_CRdf_2yrs %>% 
+      filter(X == "Age" & Y == "LMDR") %>% 
+      dplyr::rename(CR_X.Age_Y.LMDR = CR, Res_X.Age_Y.LMDR = Resilience) %>% 
+      dplyr::select(-X, -Y)
+  ) %>% 
+  left_join(
+    mcsa_CRdf_2yrs %>% 
+      filter(X == "pib_centiloid" & Y == "Memory") %>% 
+      dplyr::rename(CR_X.CL_Y.Mem = CR, Res_X.CL_Y.Mem = Resilience) %>% 
+      dplyr::select(-X, -Y)
+  ) %>% 
+  left_join(
+    mcsa_CRdf_2yrs %>% 
+      filter(X == "pib_centiloid" & Y == "LMDR") %>% 
+      dplyr::rename(CR_X.CL_Y.LMDR = CR, Res_X.CL_Y.LMDR = Resilience) %>% 
+      dplyr::select(-X, -Y)
+  ) %>% 
+  left_join(
+    mcsa_df %>% 
+      dplyr::select(SubjectID, PaxDx, LastDx, PaxDx_binary, LastDx_binary, Memory, LMDR, HippVol:Mag_HippICV, pib_centiloid, Sex:Age, APOE4, daydiff)
+  ) %>% 
+  dplyr::select(SubjectID, PaxDx, LastDx, PaxDx_binary, LastDx_binary, Memory, LMDR, HippVol:Mag_HippICV, pib_centiloid, Sex:Age, APOE4, daydiff, everything())
+
+
+adni_CRdf_2yrs <- adni_CRdf_2yrs %>% 
+  filter(X == "Age" & Y == "Memory") %>% 
+  dplyr::rename(CR_X.Age_Y.Mem = CR, Res_X.Age_Y.Mem = Resilience) %>% 
+  dplyr::select(-X, -Y) %>% 
+  left_join(
+    adni_CRdf_2yrs %>% 
+      filter(X == "Age" & Y == "LMDR") %>% 
+      dplyr::rename(CR_X.Age_Y.LMDR = CR, Res_X.Age_Y.LMDR = Resilience) %>% 
+      dplyr::select(-X, -Y)
+  ) %>% 
+  left_join(
+    adni_CRdf_2yrs %>% 
+      filter(X == "PHC_CENTILOIDS" & Y == "Memory") %>% 
+      dplyr::rename(CR_X.CL_Y.Mem = CR, Res_X.CL_Y.Mem = Resilience) %>% 
+      dplyr::select(-X, -Y)
+  ) %>% 
+  left_join(
+    adni_CRdf_2yrs %>% 
+      filter(X == "PHC_CENTILOIDS" & Y == "LMDR") %>% 
+      dplyr::rename(CR_X.CL_Y.LMDR = CR, Res_X.CL_Y.LMDR = Resilience) %>% 
+      dplyr::select(-X, -Y)
+  ) %>% 
+  left_join(
+    adni_df %>% 
+      dplyr::select(SubjectID, PaxDx, LastDx, PaxDx_binary, LastDx_binary, Memory, LMDR, HippVol:Mag_HippICV, PHC_CENTILOIDS, Sex:Age, APOE4, daydiff)
+  ) %>% 
+  dplyr::select(SubjectID, PaxDx, LastDx, PaxDx_binary, LastDx_binary, Memory, LMDR, HippVol:Mag_HippICV, PHC_CENTILOIDS, Sex:Age, APOE4, daydiff, everything())
+
+# count the number of predicted resilience based on clinical diagnosis
+mcsa_CRdf_2yrs %>% 
+  dplyr::select(starts_with("Res_")) %>%
+  mutate(Cohort = "MCSA") %>% 
+  rbind(adni_CRdf_2yrs %>% 
+          dplyr::select(starts_with("Res_")) %>% 
+          mutate(Cohort = "ADNI")) %>% 
+  pivot_longer(
+    cols = starts_with("Res_"),
+    names_to = "name",
+    values_to = "value"
+  ) %>%
+  mutate(name = factor(name, levels = c("Res_X.CL_Y.Mem", "Res_X.CL_Y.LMDR", "Res_X.Age_Y.Mem", "Res_X.Age_Y.LMDR")),
+         Cohort = factor(Cohort, levels = c("MCSA"), "ADNI")) %>% 
+  group_by(name, Cohort) %>%
+  summarise(
+    'Resilient'  = sum(value == "Resilient", na.rm = TRUE),
+    'Non-resilient' = sum(value == "Non-resilient", na.rm = TRUE),
+    'NA'    = sum(is.na(value))
+  ) %>%
+  kableExtra::kbl(caption = "Resilient status based on residuals", format = "html", table.attr = "style='width:50%;'") %>%
+  kableExtra::kable_styling() # this information is in supplementary table 14a
+
+
+# save model summary
+mcsa_cr_modelsum_2yrs = mcsa_cr_2yrs %>% mutate(model_sum = map(Model, tidy, conf.int = T)) %>% select(X, Y, model_sum) %>% unnest(model_sum)
+adni_cr_modelsum_2yrs = adni_cr_2yrs %>% mutate(model_sum = map(Model, tidy, conf.int = T)) %>% select(X, Y, model_sum) %>% unnest(model_sum)
+
+# save as excel
+write.xlsx(list("MCSA" = mcsa_CRdf_2yrs, "ADNI" = adni_CRdf_2yrs), paste0(outdir, "/2_1_3_BF/CRdf_2yrs.xlsx"))
+write.xlsx(list("MCSA" = mcsa_cr_modelsum_2yrs, "ADNI" = adni_cr_modelsum_2yrs), paste0(outdir, "/2_1_3_BF/ModelSumm_2yrs.xlsx"))
+
+# save the resilience status in comTrait
+comTrait %>% 
+  rownames_to_column("SubjectID") %>% 
+  left_join(
+    bind_rows(
+      mcsa_CRdf_2yrs %>% dplyr::select(SubjectID, Res_X.CL_Y.Mem, Res_X.CL_Y.LMDR, Res_X.Age_Y.Mem, Res_X.Age_Y.LMDR) %>% mutate(SubjectID = str_remove(SubjectID, "s_")),
+      adni_CRdf_2yrs %>% dplyr::select(SubjectID, Res_X.CL_Y.Mem, Res_X.CL_Y.LMDR, Res_X.Age_Y.Mem, Res_X.Age_Y.LMDR)
+    ), by = "SubjectID"
+  ) %>% 
+  column_to_rownames("SubjectID") %>% 
+  saveRDS(paste0(indir, "/comTrait.rds"))
+```
+
+| Column name      | Residual method to define          |
+|------------------|------------------------------------|
+| Res_X.Age_Y.Mem  | No centiloids, memory as outcome   |
+| Res_X.Age_Y.LMDR | No centiloids, LMDR as outcome     |
+| Res_X.CL_Y.Mem   | With centiloids, memory as outcome |
+| Res_X.CL_Y.LMDR  | With centiloids, LMDR as outcome   |
+
+# predictive modeling functions
+
+Adopted from: <https://lsinks.github.io/posts/2023-04-10-tidymodels/tidymodels_tutorial.html#defining-the-model-with-parsnip>
+
+```{r}
+
+modeling <- function(
+    data,
+    outcome_col,
+    predictor_col,
+    n_splits,
+    train_prop,
+    mode = c("separate", "all") # test all or separate genes at a time
+){
+  mode <- match.arg(mode)
+  
+  # remove any NA and select only needed columns
+  data <- data %>% 
+    drop_na(outcome_col, predictor_col) %>% 
+    dplyr::select(all_of(c(outcome_col, predictor_col))) 
+  
+  # set up dataframe for metrics and coefficients ----
+  metrics <- data.frame()
+  coefs   <- data.frame()
+  preds   <- data.frame()
+  
+  # Define ----
+  ## 1) models ----
+  ### standard logistic regression
+  logreg_spec <- 
+    logistic_reg() %>% 
+    set_engine("glm") %>% 
+    set_mode("classification")
+
+  ### ridge regularization
+  ridge_spec <- 
+    logistic_reg(penalty = tune(),
+                 mixture = 0) %>%
+    set_engine("glmnet") %>% 
+    set_mode("classification")
+
+  ### elastic net regularization
+  en_spec <- 
+    logistic_reg(penalty = tune(),
+                 mixture = tune()) %>%
+    set_engine("glmnet") %>% 
+    set_mode("classification")
+
+  ## 2) metrics to evaluate ----
+  custom_metric_set = metric_set(roc_auc, sensitivity, specificity)
+  
+  ## 3) formula ----
+  formula = as.formula(paste0(outcome_col, " ~ ", paste0(predictor_col, collapse = " + ")))
+  
+  if (mode == "separate"){
+    # Loop over splits (separate) ----
+    for (s in seq_len(n_splits)){
+      set.seed(s)
+      ## Split the data into a test and training set
+      data_split <- initial_split(data, prop = train_prop, strata = outcome_col)     
+      
+      ## Create data frames for the two sets:
+      train_data <- training(data_split)
+      test_data  <- testing(data_split)
+      
+      ## Create recipe
+      recipe <- 
+        recipe(formula, data = train_data) %>% 
+        step_dummy(all_nominal_predictors())
+      
+      ## create workflow
+      wf <- 
+        workflow() %>% 
+        add_recipe(recipe) %>% 
+        add_model(logreg_spec)
+  
+      ## fitting
+      last_fit_results <- last_fit(wf, data_split, metrics = custom_metric_set)
+  
+      ## collect coefficients
+      coefs <- rbind(
+        coefs,
+        last_fit_results %>% extract_fit_parsnip() %>% tidy() %>% mutate(split = s)
+      )
+  
+      ## collect metrics
+      metrics <- rbind(
+        metrics,
+        last_fit_results %>% collect_metrics() %>% mutate(split = s)
+      )
+      
+      ## collect predictions
+      preds <- rbind(
+        preds,
+        last_fit_results %>% collect_predictions() %>% mutate(split = s)
+      )
+    }
+    # Create a summary metrics dataframe over all the splits
+    summary <- metrics %>% 
+      summarise(
+        mean = mean(.estimate, na.rm = T), 
+        sd = sd(.estimate, na.rm = T), 
+        .by = c(.metric)
+      )
+  }
+  
+  else if (mode == "all"){
+    # Loop over splits (all) ----
+    for (s in seq_len(n_splits)){
+      print(paste0("At split: ", s))
+      set.seed(s)
+      ## Split the data into a test and training set
+      data_split <- initial_split(data, prop = train_prop, strata = outcome_col)     
+      
+      ## Create data frames for the two sets:
+      train_data <- training(data_split)
+      test_data  <- testing(data_split)
+      
+      ## Create recipe
+      recipe <- 
+        recipe(formula, data = train_data) %>% 
+        step_dummy(all_nominal_predictors())
+      
+      ## create workflow
+      wf_tune <- 
+        workflow_set(
+          list(data = recipe),
+          list(logreg = logreg_spec, ridge = ridge_spec, en = en_spec)
+        )
+
+      ## tuning
+      set.seed(1234)
+      folds <- vfold_cv(train_data, v = 10, strata = outcome_col)
+      tune_results <- 
+        workflow_map(
+          wf_tune,
+          "tune_grid",
+          resamples = folds,
+          grid = 10,
+          metrics = custom_metric_set,
+          verbose = F
+        )
+      
+      ## get best parameters (for ridge and en) and fitting 
+      
+      ### logreg
+      validation_logreg <- tune_results %>% extract_workflow("data_logreg") %>% last_fit(split =  data_split, metrics = custom_metric_set)
+      
+      ### ridge
+      best_ridge <- tune_results %>% extract_workflow_set_result("data_ridge") %>% select_best(metric = "roc_auc")
+      validation_ridge <- tune_results %>% extract_workflow("data_ridge") %>% finalize_workflow(best_ridge) %>% last_fit(split =  data_split, metrics = custom_metric_set)
+      
+      ### EN
+      best_en <- tune_results %>% extract_workflow_set_result("data_en") %>% select_best(metric = "roc_auc")
+      validation_en <- tune_results %>% extract_workflow("data_en") %>% finalize_workflow(best_en) %>% last_fit(split =  data_split, metrics = custom_metric_set)
+
+      ## collect coefficients
+      coefs <- rbind(
+        coefs,
+        validation_logreg %>% extract_fit_parsnip() %>% tidy() %>% dplyr::select(term, estimate) %>% mutate(penalty = NA, split = s, model_type = "logreg"),
+        validation_ridge %>% extract_fit_parsnip() %>% tidy() %>% mutate(split = s, model_type = "ridge"),
+        validation_en %>% extract_fit_parsnip() %>% tidy() %>% mutate(split = s, model_type = "en")
+      )
+  
+      ## collect metrics
+      metrics <- rbind(
+        metrics,
+        validation_logreg %>% collect_metrics() %>% mutate(split = s, model_type = "logreg"),
+        validation_ridge %>% collect_metrics() %>% mutate(split = s, model_type = "ridge"),
+        validation_en %>% collect_metrics() %>% mutate(split = s, model_type = "en")
+      )
+      
+      ## collect predictions
+      preds <- rbind(
+        preds,
+        validation_logreg %>% collect_predictions() %>% mutate(split = s, model_type = "logreg"),
+        validation_ridge %>% collect_predictions() %>% mutate(split = s, model_type = "ridge"),
+        validation_en %>% collect_predictions() %>% mutate(split = s, model_type = "en")
+      )
+    }
+    # Create a summary metrics dataframe over all the splits
+    summary <- metrics %>% 
+      summarise(
+        mean = mean(.estimate, na.rm = T), 
+        sd = sd(.estimate, na.rm = T), 
+        .by = c(.metric, model_type)
+      )
+  }
+  
+  
+  
+  
+  # Final storage 
+  list(
+    metrics_all = metrics,
+    summary     = summary,
+    coef_all    = coefs
+  )
+}
+
+run_modeling <- function(
+  data,
+  outcome_cols, 
+  gene_vars,
+  demo_vars,
+  mode = c("separate", "all"),
+  n_splits = 100,
+  train_prop = 0.7
+){
+  mode <- match.arg(mode)
+  
+  # store all results by outcome
+  results <- list()
+  
+  for (outcome in outcome_cols) {
+    print(paste0("OUTCOME: ", outcome))
+    
+    results[[outcome]] <- list()
+    
+    ## ----------------------------------------------------------
+    ## MODE 1: EACH GENE SEPARATELY
+    ## ----------------------------------------------------------
+    if (mode == "separate") {
+      
+      separate_list <- list()
+      
+      for (g in gene_vars) {
+        pred_cols <- c(demo_vars, g)
+        
+        print(paste0("Running gene: ", g))
+        
+        separate_list[[g]] <-
+          modeling(
+            data          = data,
+            outcome_col   = outcome,
+            predictor_col = pred_cols,
+            n_splits      = n_splits,
+            train_prop    = train_prop,
+            mode          = mode
+          )
+      }
+      
+      results[[outcome]] <- separate_list
+    }
+    
+    ## ----------------------------------------------------------
+    ## MODE 2: ALL GENES AT ONCE
+    ## ----------------------------------------------------------
+    if (mode == "all") {
+      pred_cols <- c(demo_vars, gene_vars)
+      
+      print("Running: all genes together")
+      
+      results[[outcome]] <-
+        modeling(
+          data          = data,
+          outcome_col   = outcome,
+          predictor_col = pred_cols,
+          n_splits      = n_splits,
+          train_prop    = train_prop,
+          mode          = mode
+        )
+    }
+  }
+  
+  return(results)
+}
+
+
+```
+
+# Prepare input files
+
+The input files are used for: 1) predictive modelling 2) regression with diagnosis as a covariate 3) stratified analysis
+
+```{r}
+comRes <- readRDS(paste0(residir, "/comRes.rds")) # from 1_CreateResids.R
+nduf_bb <- read.csv(paste0(nduf_assoc_dir, "/nduf_bb.csv")) #generated in 4_nduf_assoc_de.R
+MEs1 <- read.csv(paste0(blwgcna_dir, "/MEs1_SP12.csv")) #from 2_blwgcna.R
+
+# select the residuals of NDUFs
+nduf_res <- comRes[,nduf_bb$gene_id]
+nduf_res <- data.frame(nduf_res)
+# rename geneID to gene name of NDUFs
+nduf_res  <- nduf_res  %>% rename_at(vars(1:(ncol(.))), ~ nduf_bb$gene_name[match(names(nduf_res)[1:(ncol(nduf_res))], nduf_bb$gene_id)])
+
+mcsa_covars <- read_delim(paste0(indir,"/R01_Resilience_PAXgene_Covars.txt"), delim = "\t") %>% mutate(SubjectID=as.character(ptnum)) #covariates file for MCSA, rows are donor columns are covariates
+adni_covars <- read_delim(paste0(residir,"/ADNI_s91_covars.txt"), delim = "\t") #covariates file for 91 donors from ADNI. Rows are donors columns are covariates
+
+# prepare input dataframes
+mcsa_input <- mcsa_CRdf_2yrs %>% 
+  mutate(SubjectID = str_remove(SubjectID, "s_")) %>% 
+  mutate(
+    across(starts_with("Res_X."),
+           ~ as.character(.x))
+  ) %>% 
+  left_join(mcsa_covars %>% dplyr::select(SubjectID, RIN, PAXgene_flowcell, PAXgene_Batch)) %>%  # select technical variables of RNAsequencing for adjustment
+  left_join(nduf_res %>% rownames_to_column("SubjectID")) %>% 
+  left_join(MEs1 %>% dplyr::select(SubjectID, ME3)) %>% 
+  mutate(APOE4 = factor(APOE4)) %>% 
+  mutate(across(
+    starts_with("Res_X."),
+    ~ factor(.x, levels = c("Resilient", "Non-resilient"))
+  )) %>% 
+  mutate(across(
+    ends_with("_binary"),
+    ~ factor(.x, levels = c("Control", "Case"))
+  ))
+adni_input <- adni_CRdf_2yrs %>%
+  mutate(
+    across(starts_with("Res_X."),
+           ~ as.character(.x))
+  ) %>%
+  left_join(adni_covars %>% dplyr::select(SubjectID, RIN, AffyPlate.meanREE, SITE.meanREE)) %>% # select technical variables of RNAsequencing for adjustment
+  left_join(nduf_res %>% rownames_to_column("SubjectID")) %>% 
+  left_join(MEs1 %>% dplyr::select(SubjectID, ME3)) %>% 
+  mutate(APOE4 = factor(APOE4)) %>% 
+  mutate(across(
+    starts_with("Res_X."),
+    ~ factor(.x, levels = c("Resilient", "Non-resilient"))
+  )) %>% 
+  mutate(across(
+    ends_with("_binary"),
+    ~ factor(.x, levels = c("Control", "Case"))
+  ))
+save(mcsa_input, adni_input, file = paste0(outdir, "/2_1_3_BF/inputdf.RData"))
+```
+
+# Make gene-gene corr plot
+```{r}
+mcsa_nduf_corr <- cor(mcsa_input[,nduf_bb$gene_name])
+mcsa_nduf_corr_p <- cor_pmat(mcsa_input[,nduf_bb$gene_name])
+adni_nduf_corr <- cor(adni_input[,nduf_bb$gene_name])
+adni_nduf_corr_p <- cor_pmat(adni_input[,nduf_bb$gene_name])
+
+pdf(paste0(outdir, "/2_1_3_BF/ggcorrplot.pdf"), width = 7, height = 4)
+ggcorrplot(mcsa_nduf_corr, 
+           type = "lower",
+           colors = c("dodgerblue", "white", "firebrick"),
+           p.mat = mcsa_nduf_corr_p,
+           pch.cex = 0.8
+) +
+  labs(title = "MCSA NDUFs Correlation", x = "", y= "") +
+  theme_classic(base_size = 6.5) +
+  theme(plot.title = element_text(hjust = 0.5),
+        axis.text.x = element_text(angle = 90, vjust = 0.5, face = "italic"),
+        axis.text.y = element_text(face = "italic"),
+        legend.key.size = unit(0.1, "in")) +
+ggcorrplot(adni_nduf_corr, 
+           type = "lower",
+           colors = c("dodgerblue", "white", "firebrick"),
+           p.mat = adni_nduf_corr_p,
+           pch.cex = 0.8
+) +
+  labs(title = "ADNI NDUFs Correlation", x = "", y= "") +
+  theme_classic(base_size = 6.5) +
+  theme(plot.title = element_text(hjust = 0.5),
+        axis.text.x = element_text(angle = 90, vjust = 0.5, face = "italic"),
+        axis.text.y = element_text(face = "italic"),
+        legend.key.size = unit(0.1, "in"))
+dev.off() # this is extended data fig.12b
+```
+
+
+# Run the predictive modeling
+
+Running these takes some time
+
+```{r mcsa -resids run modelling}
+mcsa_sep <- run_modeling(
+  data = mcsa_input,
+  outcome_cols = c("Res_X.Age_Y.Mem", "Res_X.Age_Y.LMDR", "Res_X.CL_Y.Mem", "Res_X.CL_Y.LMDR"),
+  demo_vars = NULL,
+  gene_vars = c("ME3", nduf_bb$gene_name),
+  mode = "separate"
+)
+
+mcsa_all <- run_modeling(
+  data = mcsa_input,
+  outcome_cols = c("Res_X.Age_Y.Mem", "Res_X.Age_Y.LMDR", "Res_X.CL_Y.Mem", "Res_X.CL_Y.LMDR"),
+  demo_vars = NULL,
+  gene_vars = nduf_bb$gene_name,
+  mode = "all"
+)
+
+# organize the results into dataframe
+mcsa_sep_sum <- map_df(
+  names(mcsa_sep),
+  function(outcome) {
+    map_df(
+      names(mcsa_sep[[outcome]]),
+      function(x) {
+        mcsa_sep[[outcome]][[x]]$summary %>%
+          mutate(Outcome = outcome, XVar = x)
+      }
+    )
+  }
+)
+mcsa_all_sum <- map_df(
+  names(mcsa_all),
+  function(outcome) {
+    mcsa_all[[outcome]]$summary %>%
+      mutate(Outcome = outcome, Gene = "all_genes")
+  }
+)
+```
+
+```{r adni - resids run modelling}
+adni_sep <- run_modeling(
+  data = adni_input,
+  outcome_cols = c("Res_X.Age_Y.Mem", "Res_X.Age_Y.LMDR", "Res_X.CL_Y.Mem", "Res_X.CL_Y.LMDR"),
+  demo_vars = NULL,
+  gene_vars = c("ME3", nduf_bb$gene_name),
+  mode = "separate"
+)
+
+adni_all <- run_modeling(
+  data = adni_input,
+  outcome_cols = c("Res_X.Age_Y.Mem", "Res_X.Age_Y.LMDR", "Res_X.CL_Y.Mem", "Res_X.CL_Y.LMDR"),
+  demo_vars = NULL,
+  gene_vars = nduf_bb$gene_name,
+  mode = "all"
+)
+
+# organize the results into dataframe
+adni_sep_sum <- map_df(
+  names(adni_sep),
+  function(outcome) {
+    map_df(
+      names(adni_sep[[outcome]]),
+      function(x) {
+        adni_sep[[outcome]][[x]]$summary %>%
+          mutate(Outcome = outcome, XVar = x)
+      }
+    )
+  }
+)
+adni_all_sum <- map_df(
+  names(adni_all),
+  function(outcome) {
+    adni_all[[outcome]]$summary %>%
+      mutate(Outcome = outcome, Gene = "all_genes")
+  }
+)
+```
+
+
+## save and summarize results
+
+```{r save results}
+save(mcsa_sep, mcsa_all, adni_sep, adni_all,
+     file = paste0(outdir, "/2_1_3_BF/resids2yrs_TM.RData"))
+# calculate standard error and low and high 95% CI for metrics across 100 resampling splits
+mcsa_all_sum <- mcsa_all_sum %>% 
+  mutate(Cohort = "MCSA", .before = ".metric") %>% 
+  mutate(
+    se = sd / sqrt(100),
+    L95 = mean - 1.96*se,
+    H95 = mean + 1.96*se,
+    .after = "sd"
+  )
+mcsa_sep_sum <- mcsa_sep_sum %>% 
+  mutate(Cohort = "MCSA", .before = ".metric") %>% 
+  mutate(
+    se = sd / sqrt(100),
+    L95 = mean - 1.96*se,
+    H95 = mean + 1.96*se,
+    .after = "sd"
+  )
+
+
+adni_all_sum <- adni_all_sum %>% 
+  mutate(Cohort = "ADNI", .before = ".metric") %>% 
+  mutate(
+    se = sd / sqrt(100),
+    L95 = mean - 1.96*se,
+    H95 = mean + 1.96*se,
+    .after = "sd"
+  )
+adni_sep_sum <- adni_sep_sum %>% 
+  mutate(Cohort = "ADNI", .before = ".metric") %>% 
+  mutate(
+    se = sd / sqrt(100),
+    L95 = mean - 1.96*se,
+    H95 = mean + 1.96*se,
+    .after = "sd"
+  )
+
+write.xlsx(list(
+  "All" = rbind(mcsa_all_sum, adni_all_sum),
+  "Sep" = rbind(mcsa_sep_sum, adni_sep_sum),
+  "Sep_AUC_Check" = rbind(mcsa_sep_sum, adni_sep_sum) %>% filter(.metric == "roc_auc") %>%  group_by(XVar, Outcome) %>% mutate(BothAbove0.6 = ifelse(sum(mean>=0.6)>=2, TRUE, FALSE))
+), paste0(outdir, "/2_1_3_BF/resids2yrs_summ_TM.xlsx"))
+```
+
+# Perform meta-analysis
+
+Follow the guides from <https://pmc.ncbi.nlm.nih.gov/articles/PMC7925865>; <https://www.bmj.com/content/356/bmj.i6460>
+
+```{r}
+# function for meta-analysis 
+auc_meta <- function(auc_data){ 
+  require(metafor) #v4.8
+  
+  # Logit transform + delta method for variance
+  auc_data$yi <- log(auc_data$auc / (1 - auc_data$auc))
+  auc_data$vi <- auc_data$se^2 / (auc_data$auc * (1 - auc_data$auc))^2 #this formula is from Debray 2017 appendix 6
+  
+  # run random-effect meta-analysis
+  res <- rma(yi = yi, vi = vi, data = auc_data, method = "REML")
+  
+  # back-transform logit pooled AUC and 95% CI
+  backtrns <- data.frame(
+    AUC = plogis(res$b),
+    L95 = plogis(res$ci.lb),
+    H95 = plogis(res$ci.ub)
+  )
+  # heterogeneity
+  heterogeneity <- data.frame(
+    Q    = res$QE,       # Cochran's Q statistic
+    Qp   = res$QEp,      # p-value for Q
+    I2   = res$I2,       # % variance due to heterogeneity
+    tau2 = res$tau2,     # between-study variance (on logit scale)
+    se.tau2  = res$se.tau2       # SD of true effects (sqrt of tau2)
+  )
+  # forest plot
+  metafor::forest(res, transf = plogis, slab = auc_data$study, xlab = "AUC")
+  forest_p <- recordPlot()
+  
+  results <- list(
+    Meta_analysis = res,
+    Backtrns_df = backtrns,
+    Heterogeneity = heterogeneity,
+    ForestP = forest_p
+  )
+  return(results)
+}
+
+
+```
+
+```{r perform meta-analysis}
+# meta-analysis for results testing one NDUF at a time
+## organize the input dataframe for meta-analysis, this splits into a list of dataframe grouped by outcome variable ("Res_X.Age_Y.Mem", "Res_X.Age_Y.LMDR", "Res_X.CL_Y.Mem", "Res_X.CL_Y.LMDR") and gene 
+both_auc_sep_sum <- mcsa_sep_sum %>% 
+  filter(.metric == "roc_auc") %>% 
+  mutate(study = "MCSA") %>% 
+  rbind(adni_sep_sum %>% 
+          filter(.metric == "roc_auc") %>% 
+          mutate(study = "ADNI")
+  ) %>% 
+  mutate(n_splits = 100) %>% 
+  rename(auc = mean) %>% 
+  named_group_split(XVar, Outcome)
+
+## run the meta-analysis and transform the back-transformed AUC and 95% CI and heterogeneity stats into dataframes
+meta_auc_sep <- map(both_auc_sep_sum, ~ auc_meta(.x))
+meta_auc_sep_combined <- meta_auc_sep %>%
+  map("Backtrns_df") %>%
+  bind_rows(.id = "XVar_Outcome") %>% 
+  remove_rownames() %>% 
+  separate(XVar_Outcome, into = c("XVar", "Outcome"), sep = " / ")
+meta_het_sep_combined <- meta_auc_sep %>%
+  map("Heterogeneity") %>%
+  bind_rows(.id = "XVar_Outcome") %>% 
+  remove_rownames() %>% 
+  separate(XVar_Outcome, into = c("XVar", "Outcome"), sep = " / ")
+
+#replayPlot(meta_auc_sep[["ME3 / Res_X.Age_Y.LMDR"]]$ForestP)
+
+# meta-analysis for results testing all NDUFs at once
+both_auc_all_sum <- mcsa_all_sum %>% 
+  filter(.metric == "roc_auc") %>% 
+  mutate(study = "MCSA") %>% 
+  rbind(adni_all_sum %>% 
+          filter(.metric == "roc_auc") %>% 
+          mutate(study = "ADNI")
+  ) %>% 
+  mutate(n_splits = 100) %>% 
+  rename(auc = mean) %>% 
+  named_group_split(model_type, Outcome)
+
+meta_auc_all <- map(both_auc_all_sum, ~ auc_meta(.x))
+meta_auc_all_combined <- meta_auc_all %>%
+  map("Backtrns_df") %>%
+  bind_rows(.id = "ModelType_Outcome") %>% 
+  remove_rownames() %>% 
+  separate(ModelType_Outcome, into = c("ModelType", "Outcome"), sep = " / ")
+meta_het_all_combined <- meta_auc_all %>%
+  map("Heterogeneity") %>%
+  bind_rows(.id = "ModelType_Outcome") %>% 
+  remove_rownames() %>% 
+  separate(ModelType_Outcome, into = c("ModelType", "Outcome"), sep = " / ")
+
+```
+
+```{r save meta-analysis results}
+# save in excel sheet
+wb <- loadWorkbook(paste0(outdir, "/2_1_3_BF/resids2yrs_summ_TM.xlsx"))
+addWorksheet(wb, "meta_auc_sep")
+addWorksheet(wb, "meta_het_sep")
+addWorksheet(wb, "meta_auc_all")
+addWorksheet(wb, "meta_het_all")
+writeData(wb, sheet = "meta_auc_sep", x = meta_auc_sep_combined)
+writeData(wb, sheet = "meta_het_sep", x = meta_het_sep_combined)
+writeData(wb, sheet = "meta_auc_all", x = meta_auc_all_combined)
+writeData(wb, sheet = "meta_het_all", x = meta_het_all_combined)
+saveWorkbook(wb, paste0(outdir, "/2_1_3_BF/resids2yrs_summ_TM.xlsx"), overwrite = T) 
+```
+
+| Outcome              | Meta AUC  |
+|----------------------|-----------|
+| Res_X.Age_Consistent | 0.6647678 |
+| Res_X.Age_Y.LMDR     | 0.6695683 |
+| Res_X.Age_Y.Mem      | 0.5639113 |
+| Res_X.CL_Consistent  | 0.6026014 |
+| Res_X.CL_Y.LMDR      | 0.6225901 |
+| Res_X.CL_Y.Mem       | 0.4944292 |
+
+# Check number of people with memory, LMDR and HV per dx/resilience group
+This is for reviewer 2 comment 1
+```{r check number}
+mcsa_input %>%
+  mutate(across(c("Res_X.Age_Y.Mem", "Res_X.Age_Y.LMDR", "Res_X.CL_Y.Mem", "Res_X.CL_Y.LMDR"), ~ ifelse(.x == "Resilient", "Control", "Case"))) %>% 
+  pivot_longer(cols = c("Memory", "LMDR", "HippVol"),
+               names_to = "Phenotype",
+               values_to = "PhenoValue") %>%
+  pivot_longer(cols = c("LastDx_binary", "Res_X.Age_Y.Mem", "Res_X.Age_Y.LMDR", "Res_X.CL_Y.Mem", "Res_X.CL_Y.LMDR"),
+               names_to = "Stratification",
+               values_to = "Status") %>% 
+  mutate(
+    Phenotype = factor(Phenotype, levels = c("Memory", "LMDR", "HippVol")),
+    Stratification = factor(Stratification, levels = c("LastDx_binary", "Res_X.Age_Y.Mem", "Res_X.Age_Y.LMDR", "Res_X.CL_Y.Mem", "Res_X.CL_Y.LMDR"))
+  ) %>%
+  filter(!is.na(PhenoValue)) %>%
+  filter(Status == "Control") %>% 
+  group_by(Phenotype, Stratification) %>%
+  summarise(N = n(), .groups = "drop")
+
+adni_input %>%
+  mutate(across(c("Res_X.Age_Y.Mem", "Res_X.Age_Y.LMDR", "Res_X.CL_Y.Mem", "Res_X.CL_Y.LMDR"), ~ ifelse(.x == "Resilient", "Control", "Case"))) %>% 
+  pivot_longer(cols = c("Memory", "LMDR", "HippVol"),
+               names_to = "Phenotype",
+               values_to = "PhenoValue") %>%
+  pivot_longer(cols = c("LastDx_binary", "Res_X.Age_Y.Mem", "Res_X.Age_Y.LMDR", "Res_X.CL_Y.Mem", "Res_X.CL_Y.LMDR"),
+               names_to = "Stratification",
+               values_to = "Status") %>% 
+  mutate(
+    Phenotype = factor(Phenotype, levels = c("Memory", "LMDR", "HippVol")),
+    Stratification = factor(Stratification, levels = c("LastDx_binary", "Res_X.Age_Y.Mem", "Res_X.Age_Y.LMDR", "Res_X.CL_Y.Mem", "Res_X.CL_Y.LMDR"))
+  ) %>% 
+  filter(!is.na(PhenoValue)) %>%
+  filter(Status == "Control") %>% 
+  group_by(Phenotype, Stratification) %>%
+  summarise(N = n(), .groups = "drop")
+```
+
+# Plot
+
+## Plot AUC results
+These are in the first rebuttal Rebuttal Fig.28
+```{r plot resids}
+sep_df4p <- read.xlsx(paste0(outdir, "/2_1_3_BF/resids2yrs_summ_TM.xlsx"), sheet = "Sep")
+all_df4p <- read.xlsx(paste0(outdir, "/2_1_3_BF/resids2yrs_summ_TM.xlsx"), sheet = "All")
+meta_sep_df4p <- read.xlsx(paste0(outdir, "/2_1_3_BF/resids2yrs_summ_TM.xlsx"), sheet = "meta_auc_sep")
+meta_all_df4p <- read.xlsx(paste0(outdir, "/2_1_3_BF/resids2yrs_summ_TM.xlsx"), sheet = "meta_auc_all")
+# organize the dataframe for plotting
+sep_forestp_df <- sep_df4p %>%
+  filter(.metric == "roc_auc") %>% 
+  dplyr::select(Cohort, XVar, Outcome, mean, L95, H95) %>% 
+  rename(AUC = mean) %>% 
+  rbind(meta_sep_df4p %>% mutate(Cohort = "Meta-analyzed")) %>% 
+  mutate(Outcome = case_when(
+           Outcome == "Res_X.Age_Y.Mem" ~ "Memory\n(no centiloids)",
+           Outcome == "Res_X.Age_Y.LMDR" ~ "LMDR\n(no centiloids)",
+           Outcome == "Res_X.CL_Y.Mem" ~ "Memory\n(with centiloids)",
+           Outcome == "Res_X.CL_Y.LMDR" ~ "LMDR\n(with centiloids)",
+           TRUE ~ NA_character_
+         ),
+         Outcome = factor(Outcome, levels = c("Memory\n(no centiloids)", "LMDR\n(no centiloids)", "Memory\n(with centiloids)", "LMDR\n(with centiloids)")),
+         Cohort = factor(Cohort, levels = c("ADNI", "MCSA", "Meta-analyzed")))
+
+pdf(paste0(outdir, "/2_1_3_BF/resids_AUC_forestp_TM.pdf"), height = 7, width = 7)
+sep_forestp_df %>% 
+  filter(!is.na(Outcome)) %>% 
+  ggplot(aes(x=AUC, y=XVar, col=Cohort)) + 
+    geom_errorbar(aes(xmax = H95, xmin = L95, color = Cohort), linewidth = 0.5, width = 0.5, position=position_dodge(width = 0.5)) + 
+    geom_point(aes(color = Cohort), size = 2, position=position_dodge(width = 0.5)) +
+    labs(x = "AUC") +
+    facet_grid(. ~ Outcome, scales = "free") + 
+    scale_y_discrete(limits = rev) + 
+    scale_color_manual(values = c("ADNI" = "green4", "MCSA" = "blue4", "Meta-analyzed" = "cyan2")) +
+    geom_vline(xintercept = 0.5, color = "red", linewidth = 0.4, linetype = 2) +
+    geom_vline(xintercept = 0.6, color = "orange3", linewidth = 0.4, linetype = 2) +
+    theme_bw() +
+    theme(
+      axis.text.y = element_text(face= "italic"),
+      axis.title.y = element_blank(),
+      plot.title = element_text(hjust = 0.5)) 
+dev.off()
+
+all_forestp_df <- all_df4p %>% 
+  filter(.metric == "roc_auc") %>% 
+  dplyr::select(Cohort, model_type, Outcome, mean, L95, H95) %>% 
+  rename(ModelType = model_type, AUC = mean) %>% 
+  rbind(meta_all_df4p %>% mutate(Cohort = "Meta-analyzed")) %>% 
+  mutate(Outcome = case_when(
+           Outcome == "Res_X.Age_Y.Mem" ~ "Memory\n(no centiloids)",
+           Outcome == "Res_X.Age_Y.LMDR" ~ "LMDR\n(no centiloids)",
+           Outcome == "Res_X.CL_Y.Mem" ~ "Memory\n(with centiloids)",
+           Outcome == "Res_X.CL_Y.LMDR" ~ "LMDR\n(with centiloids)",
+           TRUE ~ NA_character_
+         ),
+         Outcome = factor(Outcome, levels = c("Memory\n(no centiloids)", "LMDR\n(no centiloids)", "Memory\n(with centiloids)", "LMDR\n(with centiloids)")),
+         Cohort = factor(Cohort, levels = c("ADNI", "MCSA", "Meta-analyzed")),
+         ModelType = case_when(
+           ModelType == "logreg" ~ "No penalization",
+           ModelType == "ridge" ~ "Ridge",
+           ModelType == "en" ~ "EN"
+         ),
+         ModelType = factor(ModelType, levels = c("EN", "Ridge","No penalization")))
+
+
+pdf(paste0(outdir, "/2_1_3_BF/resids_allgenes_AUC_forestp_TM.pdf"), height = 3, width = 7)
+all_forestp_df %>% 
+  filter(!is.na(Outcome)) %>% 
+  ggplot(aes(x=AUC, y=ModelType, col=Cohort)) + 
+  geom_errorbar(aes(xmax = H95, xmin = L95, color = Cohort), linewidth = 0.5, width = 0.5, position=position_dodge(width = 0.5)) + 
+  geom_point(aes(color = Cohort), size = 2, position=position_dodge(width = 0.5)) +
+  labs(x = "AUC") +
+  scale_color_manual(values = c("ADNI" = "green4", "MCSA" = "blue4", "Meta-analyzed" = "cyan2")) +
+  geom_vline(xintercept = 0.5, color = "red", linewidth = 0.4, linetype = 2) +
+  geom_vline(xintercept = 0.6, color = "orange3", linewidth = 0.4, linetype = 2) +
+  facet_grid(. ~ Outcome, scales = "free") +
+  theme_bw() +
+  theme(
+      axis.title.y = element_blank(),
+      plot.title = element_text(hjust = 0.5))
+dev.off()
+
+# plot prioritized ones having meta AUC>=0.6 in both models with or without using centiloids for LMDR
+pdf(paste0(outdir, "/2_1_3_BF/resids_AUC_forestp_TM_prioritized.pdf"), height = 3, width = 4.5)
+sep_forestp_df %>% 
+  filter(grepl("LMDR", Outcome)) %>% 
+  filter(XVar %in% c("NDUFA9", "NDUFV1", "NDUFAF2", "NDUFS8", "NDUFB8")) %>% 
+  ggplot(aes(x=AUC, y=XVar, col=Cohort)) + 
+    geom_errorbar(aes(xmax = H95, xmin = L95, color = Cohort), linewidth = 0.5, width = 0.5, position=position_dodge(width = 0.5)) + 
+    geom_point(aes(color = Cohort), size = 2, position=position_dodge(width = 0.5)) +
+    labs(x = "AUC") +
+    facet_grid(. ~ Outcome, scales = "free") + 
+    scale_y_discrete(limits = rev) + 
+    scale_x_continuous(labels = scales::label_number(accuracy = 0.01)) +
+    scale_color_manual(values = c("ADNI" = "green4", "MCSA" = "blue4", "Meta-analyzed" = "cyan2")) +
+    geom_vline(xintercept = 0.5, color = "red", linewidth = 0.4, linetype = 2) +
+    geom_vline(xintercept = 0.6, color = "orange3", linewidth = 0.4, linetype = 2) +
+    theme_bw() +
+    theme(
+      axis.text.y = element_text(face= "italic"),
+      axis.title.y = element_blank(),
+      axis.text.x = element_text(angle = 25, hjust = 1),
+      plot.title = element_text(hjust = 0.5),
+      legend.margin = margin(0, 0, 0, 0, "in"), 
+      legend.text = element_text(size = 8), 
+      legend.title = element_text(size = 8.5))
+dev.off()
+```
+

@@ -1,0 +1,1108 @@
+---
+title: "rbt_1_4_cbx: LM10"
+output: html_document
+date: "2026-02-21"
+---
+
+Author: Wei (Adelyn) Tsai; [tsai.wei\@mayo.edu](mailto:tsai.wei@mayo.edu){.email}.
+
+If you are using this script, please cite our study.
+
+This script addresses comment 4 about cell type proportion from reviewer 1
+Please note that based on the 2nd rebuttal, results related to Bl_M3 have been updated. Please see rebuttal_2nd/rbt_1_4.Rmd for more details.
+
+```{r prep}
+suppressPackageStartupMessages(library(tidyverse)) #v2.0.0
+suppressPackageStartupMessages(library(patchwork)) #v1.3.2
+suppressPackageStartupMessages(library(broom)) #v1.0.12
+suppressPackageStartupMessages(library(openxlsx)) #v4.2.8
+suppressPackageStartupMessages(library(Hmisc)) #v5.1
+suppressPackageStartupMessages(library(pbapply)) #v1.7
+suppressPackageStartupMessages(library(ggpubr)) #v0.6.0
+suppressPackageStartupMessages(library(lmerTest)) #v3.1
+suppressPackageStartupMessages(library(broom.mixed)) #v0.2.9
+
+set.seed(123)
+
+# list of input/output directories
+indir <- "./indir"
+blwgcna_dir <- "./outdir/bl_wgcna"
+nduf_assoc_dir <- "./outdir/nduf_assoc_de"
+residir <- "./outdir/resids"
+
+# output directory
+outdir <- "./Rebuttal/outdir/1_4/CBX_LM10"
+
+source("./Codes/fns.R") #source a list of frequently used functions
+```
+
+# Analyze results after adjusting for fractions
+
+## Prepare fraction dataframes for analyses
+```{r}
+mcsa_frac <- read_delim(paste0(indir, "/CBXHiRes_upload/CIBERSORTxGEP_R01_Fractions-Adjusted.txt")) # this is the CIBERSORTx fraction results of MCSA
+adni_frac <- read_delim(paste0(indir, "/CBXHiRes_upload/CIBERSORTxGEP_ADNI_s91_Fractions.txt")) # this is the CIBERSORTx fraction results of ADNI
+# Rows are subjects and each column is fraction for each cell type
+
+# renames for simplicity
+mcsa_frac <- mcsa_frac %>% 
+  dplyr::select(-`P-value`, -Correlation, -RMSE) %>% 
+  mutate(Mixture = as.character(Mixture)) %>%
+  dplyr::rename(
+    SubjectID = Mixture,
+    B_naive = `B cells naive`,
+    B_memory = `B cells memory`,
+    Plasma = `Plasma cells`,
+    CD8T = `T cells CD8`,
+    CD4T_naive = `T cells CD4 naive`,
+    CD4T_memory_resting = `T cells CD4 memory resting`,
+    CD4T_memory_activated = `T cells CD4 memory activated`,
+    Tfh = `T cells follicular helper`,
+    Tregs = `T cells regulatory (Tregs)`,
+    γδT = `T cells gamma delta`,
+    NK_resting = `NK cells resting`,
+    NK_activated = `NK cells activated`,
+    M0 = `Macrophages M0`,
+    M1 = `Macrophages M1`,
+    M2 = `Macrophages M2`,
+    DC_resting = `Dendritic cells resting`,
+    DC_activated = `Dendritic cells activated`,
+    Mast_resting = `Mast cells resting`,
+    Mast_activated = `Mast cells activated`
+    )
+adni_frac <- adni_frac %>% 
+  dplyr::select(-`P-value`, -Correlation, -RMSE) %>% 
+  mutate(Mixture = gsub("^X", "", Mixture)) %>% 
+  dplyr::rename(
+    SubjectID = Mixture,
+    B_naive = `B cells naive`,
+    B_memory = `B cells memory`,
+    Plasma = `Plasma cells`,
+    CD8T = `T cells CD8`,
+    CD4T_naive = `T cells CD4 naive`,
+    CD4T_memory_resting = `T cells CD4 memory resting`,
+    CD4T_memory_activated = `T cells CD4 memory activated`,
+    Tfh = `T cells follicular helper`,
+    Tregs = `T cells regulatory (Tregs)`,
+    γδT = `T cells gamma delta`,
+    NK_resting = `NK cells resting`,
+    NK_activated = `NK cells activated`,
+    M0 = `Macrophages M0`,
+    M1 = `Macrophages M1`,
+    M2 = `Macrophages M2`,
+    DC_resting = `Dendritic cells resting`,
+    DC_activated = `Dendritic cells activated`,
+    Mast_resting = `Mast cells resting`,
+    Mast_activated = `Mast cells activated`
+  )
+
+ct_grps <- list(
+  "Bcells"  = c("B_memory", "B_naive"),
+  "Plasma" = c("Plasma"),
+  "CD4T" = c("CD4T_memory_activated", "CD4T_memory_resting", "CD4T_naive", "Tfh", "Tregs", "γδT"),
+  "CD8T" = c("CD8T"),
+  "NK" = c("NK_activated", "NK_resting"),
+  "DC" = c("DC_activated", "DC_resting"),
+  "Monocytes" = c("Monocytes", "M0", "M1", "M2"),
+  "Mast" = c("Mast_activated", "Mast_resting"),
+  "Eosinophils" = "Eosinophils",
+  "Neutrophils" = "Neutrophils"
+) 
+
+# we added up the fractions based on grouping of LM10
+mcsa_frac_grp <- mcsa_frac %>%
+  rowwise() %>%
+  mutate(
+    Bcells = sum(c_across(any_of(ct_grps[["Bcells"]])), na.rm = TRUE),
+    Plasma = sum(c_across(any_of(ct_grps[["Plasma"]])), na.rm = TRUE),
+    CD4T = sum(c_across(any_of(ct_grps[["CD4T"]])), na.rm = TRUE),
+    CD8T = sum(c_across(any_of(ct_grps[["CD8T"]])), na.rm = TRUE),
+    NK = sum(c_across(any_of(ct_grps[["NK"]])), na.rm = TRUE),
+    DC = sum(c_across(any_of(ct_grps[["DC"]])), na.rm = TRUE),
+    Monocytes = sum(c_across(any_of(ct_grps[["Monocytes"]])),  na.rm = TRUE),
+    Mast = sum(c_across(any_of(ct_grps[["Mast"]])), na.rm = TRUE),
+    Eosinophils = sum(c_across(any_of(ct_grps[["Eosinophils"]])), na.rm = TRUE),
+    Neutrophils = sum(c_across(any_of(ct_grps[["Neutrophils"]])), na.rm = TRUE)
+  ) %>%
+  ungroup() %>%
+  dplyr::select(SubjectID, names(ct_grps)) %>% 
+  mutate(Cohort = "MCSA", .before = "SubjectID")
+
+adni_frac_grp <- adni_frac %>%
+  rowwise() %>%
+  mutate(
+    Bcells = sum(c_across(any_of(ct_grps[["Bcells"]])), na.rm = TRUE),
+    Plasma = sum(c_across(any_of(ct_grps[["Plasma"]])), na.rm = TRUE),
+    CD4T = sum(c_across(any_of(ct_grps[["CD4T"]])), na.rm = TRUE),
+    CD8T = sum(c_across(any_of(ct_grps[["CD8T"]])), na.rm = TRUE),
+    NK = sum(c_across(any_of(ct_grps[["NK"]])), na.rm = TRUE),
+    DC = sum(c_across(any_of(ct_grps[["DC"]])), na.rm = TRUE),
+    Monocytes = sum(c_across(any_of(ct_grps[["Monocytes"]])),  na.rm = TRUE),
+    Mast = sum(c_across(any_of(ct_grps[["Mast"]])), na.rm = TRUE),
+    Eosinophils = sum(c_across(any_of(ct_grps[["Eosinophils"]])), na.rm = TRUE),
+    Neutrophils = sum(c_across(any_of(ct_grps[["Neutrophils"]])), na.rm = TRUE)
+  ) %>%
+  ungroup() %>%
+  dplyr::select(SubjectID, names(ct_grps))  %>% 
+  mutate(Cohort = "ADNI", .before = "SubjectID")
+```
+
+Plot the fractions by cohort in a heatmap
+```{r heatmap by cohort}
+## heatmap 
+hm_df <- rbind(mcsa_frac_grp %>% pivot_longer(cols = (names(ct_grps)), names_to = "CellType", values_to = "Fraction"),
+               adni_frac_grp %>% pivot_longer(cols = (names(ct_grps)), names_to = "CellType", values_to = "Fraction")) %>% 
+  group_by(CellType, Cohort) %>% 
+  summarise(AveFrac = mean(Fraction)) %>%
+  mutate(Labels = scales::percent(AveFrac, accuracy = 0.1),
+         CellType = factor(CellType, levels = names(ct_grps)),
+         Cohort = factor(Cohort, levels = c("MCSA", "ADNI")))
+
+pdf(paste0(outdir, "/CBX_10CT_AveFrac_hm.pdf"), width = 3.5, height = 5)
+hm_df %>% 
+  ggplot(aes(x = Cohort, y = CellType, fill = AveFrac)) +
+  geom_tile(color = "black") +
+  geom_text(
+    aes(label = Labels),
+    color = "black", size = 11/.pt
+  ) +
+  labs(x = "", y = "") +
+  scale_fill_gradient(high = "firebrick", low = "white", name = "Average\nFraction") +
+  scale_x_discrete(expand = c(0,0)) + #remove space between ticks and plot
+  scale_y_discrete(expand = c(0,0), limits = rev) +
+  theme_classic(base_size = 12) +
+  theme(axis.line = element_blank(),
+        legend.key.size = unit(0.2, "in"),
+        axis.text.x = element_text(angle = 30, hjust =1 ))
+dev.off() # this is in extended data fig.13a
+```
+
+
+## Calculate collinearity b/w proportions 
+Focus on: Bcells, CD4T, CD8T, NK, Monocytes, Mast, Neutrophils
+```{r}
+ct_ana <- c("Bcells", "CD4T", "CD8T", "NK", "Monocytes", "Mast", "Neutrophils")
+
+
+## Perform CLR transformation
+mcsa_frac0 <- mcsa_frac_grp %>% column_to_rownames("SubjectID")
+mcsa_frac0[mcsa_frac0 <= 1e-6] <- 1e-6 # add offset for proportions estimated to be 0 
+# similar to what was done in https://www.science.org/doi/10.1126/sciadv.adn7655
+
+adni_frac0 <- adni_frac_grp %>% column_to_rownames("SubjectID")
+adni_frac0[adni_frac0 <= 1e-6] <- 1e-6
+
+mcsa_cp_clr <- mcsa_frac0 %>%
+  mutate(
+    clr = compositions::clr(across(all_of(ct_ana)))
+  )
+mcsa_cp_clr <- as_tibble(mcsa_cp_clr$clr)
+mcsa_cp_clr_wID <- mcsa_cp_clr %>% mutate(SubjectID = mcsa_frac_grp$SubjectID, .before = "Bcells")
+
+adni_cp_clr <- adni_frac0 %>%
+  mutate(
+    clr = compositions::clr(across(all_of(ct_ana)))
+  )
+adni_cp_clr <- as_tibble(adni_cp_clr$clr)
+adni_cp_clr_wID <- adni_cp_clr %>% mutate(SubjectID = adni_frac_grp$SubjectID, .before = "Bcells")
+save(mcsa_cp_clr_wID, adni_cp_clr_wID, file = paste0(outdir, "/cp_clr.RData"))
+
+rm(adni_frac0, mcsa_frac0)
+```
+
+## Cross-sectional association adjusting fractions
+```{r prepare for associations}
+comTrait <- readRDS(paste0(indir,"/comTrait.rds")) # a file having cross-sectional endophenotypes for MCSA (from row 1-105) and ADNI (from row 106-196); row names are donorID
+MEs1 <- read.csv(paste0(blwgcna_dir, "/MEs1_SP12.csv")) #from 2_blwgcna.R
+nduf_bb <- read.csv(paste0(nduf_assoc_dir, "/nduf_bb.csv")) #generated in 4_nduf_assoc_de.R
+
+cqn_raw <- read_delim(paste0(indir, "/PaX108_R01resilience_gene_CQN_neg3_postQC_s105.txt"), delim = "\t") # MCSA cqn file for 18046 genes. Each row is a gene and each column is a donor
+# filter to only focus on NDUFs 
+cqn_ndufs <- cqn_raw %>% filter(GeneId %in% nduf_bb$gene_id) %>% 
+  dplyr::select(-Chromosome, -Start, -End, -Length, -GeneId, -GeneBiotype) %>%
+  pivot_longer(-GeneName, names_to = "SubjectID", values_to = "Expr") %>%
+  pivot_wider(names_from = "GeneName", values_from = "Expr")
+mcsa_covars <- read_delim(paste0(indir,"/R01_Resilience_PAXgene_Covars.txt"), delim = "\t") %>% mutate(SubjectID=as.character(ptnum)) #covariates file for MCSA, rows are donor columns are covariates
+# prepare dataframe for association analysis
+cp4assoc_mcsa <- comTrait[1:105,] %>% 
+  rownames_to_column("SubjectID") %>% 
+  dplyr::select(SubjectID, Age, Age_last, Sex, Educ, Memory, LMDR, HippVol, Hipp_ICV, Mag_HippICV) %>% 
+  left_join(mcsa_covars %>% dplyr::select(SubjectID, RIN, PAXgene_flowcell, PAXgene_Batch)) %>% # select technical variables of RNAsequencing for adjustment
+  bind_cols(mcsa_cp_clr) %>% 
+  left_join(MEs1 %>% dplyr::select(SubjectID, ME3)) %>% 
+  left_join(cqn_ndufs) 
+  
+  
+adni_mc <- readRDS(paste0(indir,"/ADNI_s91_microarray.rds")) #microarray file for 91 donors from ADNI. This has 10116 protein-coding genes, gene id as column names, donorID as row names
+adni_covars <- read_delim(paste0(residir,"/ADNI_s91_covars.txt"), delim = "\t") #covariates file for 91 donors from ADNI. Rows are donors columns are covariates
+mc_ndufs <- adni_mc %>% dplyr::select(nduf_bb$gene_id)
+mc_ndufs <- mc_ndufs %>% rename_at(vars(1:(ncol(.))), ~ nduf_bb$gene_name[match(names(mc_ndufs)[1:(ncol(mc_ndufs))], nduf_bb$gene_id)]) 
+# prepare dataframe for association analysis
+cp4assoc_adni <- comTrait[106:196,] %>% 
+  rownames_to_column("SubjectID") %>% 
+  dplyr::select(SubjectID, Age, Age_last, Sex, Educ, Memory, LMDR, HippVol, Hipp_ICV, Mag_HippICV) %>% 
+  mutate(Mag_HippICV = factor(Mag_HippICV)) %>% 
+  left_join(adni_covars %>% dplyr::select(SubjectID, RIN, AffyPlate.meanREE, SITE.meanREE)) %>% # select technical variables of RNAsequencing for adjustment
+  bind_cols(adni_cp_clr) %>% 
+  left_join(MEs1 %>% dplyr::select(SubjectID, ME3)) %>% 
+  left_join(mc_ndufs %>% rownames_to_column("SubjectID")) 
+```
+
+```{r associations functions}
+# functions for performing associations for:
+# 1) no adjustment (the original model);
+# 2) adjust for all analyzed cell proportions;
+# 3) adjust for one analyzed cell proportion at a time
+assoc_fn <- function(df, 
+                     xvars,
+                     yvars,
+                     adjust_types,
+                     base_covs,
+                     base_covs_for_HV,
+                     cp_covs){
+  run_assoc <- function(xvar, yvar, adjustment){
+    message("Test association between ", xvar, " and ", yvar, " adjusting for ", adjustment)
+    # run original association without cell type proportion adjustment
+    if (adjustment == "None"){
+      if (xvar %in% c("Memory", "LMDR")){
+        m <- lm(paste0(yvar, " ~ ", xvar, " + ", paste0(base_covs, collapse = " + ")), data = df)
+      }
+      else if (xvar == "HippVol"){
+        m <- lm(paste0(yvar, " ~ ", xvar, " + ", paste0(base_covs_for_HV, collapse = " + ")), data = df)
+      }
+    }
+    # run association adjusting for all cell type proportions
+    else if (adjustment == "All"){
+      if (xvar %in% c("Memory", "LMDR")){
+        m <- lm(paste0(yvar, " ~ ", xvar, " + ", paste0(c(base_covs, cp_covs), collapse = " + ")), data = df)
+      }
+      else if (xvar == "HippVol"){
+        m <- lm(paste0(yvar, " ~ ", xvar, " + ", paste0(c(base_covs_for_HV, cp_covs), collapse = " + ")), data = df)
+      }
+    }
+    # run association adjusting for one cell type proportion at a time
+    else if (adjustment %in% c(cp_covs)){
+      if (xvar %in% c("Memory", "LMDR")){
+        m <- lm(paste0(yvar, " ~ ", xvar, " + ", paste0(c(base_covs, adjustment), collapse = " + ")), data = df)
+      }
+      else if (xvar == "HippVol"){
+        m <- lm(paste0(yvar, " ~ ", xvar, " + ", paste0(c(base_covs_for_HV, adjustment), collapse = " + ")), data = df)
+      }
+    }
+    
+    res_df <- tidy(m, conf.int = T)
+    
+    tbl <- tibble(
+      Model = list(m),
+      SummDf = list(res_df)
+    )
+    return(tbl)
+  }
+  
+  # Run for all combinations
+  results <- expand.grid(
+    XVar = xvars,
+    YVar = yvars,
+    ADJUST = adjust_types,
+    stringsAsFactors = F
+  ) %>%
+  mutate(result = pmap(list(XVar, YVar, ADJUST),
+                       ~ run_assoc(..1, ..2, ..3))) %>%
+  unnest(result)
+  
+  return(results)
+}
+```
+
+```{r run assoc}
+# run associations for MCSA 
+mcsa_assoc_me3 <- assoc_fn(df = cp4assoc_mcsa,
+                       xvars = c("Memory", "LMDR", "HippVol"),
+                       yvars = c("ME3"),
+                       adjust_types = c("None", "All", ct_ana),
+                       base_covs = c("Age", "Sex", "Educ"),
+                       base_covs_for_HV = c("Age", "Sex", "Educ", "Hipp_ICV"),
+                       cp_covs = ct_ana
+                       )
+mcsa_assoc <- assoc_fn(df = cp4assoc_mcsa,
+                       xvars = c("Memory", "LMDR", "HippVol"),
+                       yvars = c(nduf_bb$gene_name),
+                       adjust_types = c("None", "All", ct_ana),
+                       base_covs = c("Age", "Sex", "Educ", "RIN", "PAXgene_flowcell", "PAXgene_Batch"),
+                       base_covs_for_HV = c("Age", "Sex", "Educ", "Hipp_ICV", "RIN", "PAXgene_flowcell", "PAXgene_Batch"),
+                       cp_covs = ct_ana
+                       )
+mcsa_assoc_df <- rbind(mcsa_assoc_me3, mcsa_assoc) %>% 
+  dplyr::select(XVar, YVar, ADJUST, SummDf) %>% 
+  unnest(SummDf) %>% 
+  filter(str_detect(term, XVar)) %>% 
+  group_by(XVar, ADJUST) %>% 
+  mutate(q_local = p.adjust(p.value, "fdr"), .after = "p.value") %>% # this adjusts for number of genes/ME tested (n=21)
+  ungroup() %>% 
+  group_by(XVar) %>% 
+  mutate(q_global = p.adjust(p.value, "fdr"), .after = "q_local") %>% # this adjusts for number of genes x adjustment tested (21*9)
+  ungroup()
+
+# run associations for ADNI
+adni_assoc_me3 <- assoc_fn(df = cp4assoc_adni,
+                       xvars = c("Memory", "LMDR", "HippVol"),
+                       yvars = c("ME3"),
+                       adjust_types = c("None", "All", ct_ana),
+                       base_covs = c("Age", "Sex", "Educ"),
+                       base_covs_for_HV = c("Age", "Sex", "Educ", "Hipp_ICV", "Mag_HippICV"),
+                       cp_covs = ct_ana
+                       )
+adni_assoc <- assoc_fn(df = cp4assoc_adni,
+                       xvars = c("Memory", "LMDR", "HippVol"),
+                       yvars = c(nduf_bb$gene_name),
+                       adjust_types = c("None", "All", ct_ana),
+                       base_covs = c("Age", "Sex", "Educ", "RIN", "AffyPlate.meanREE", "SITE.meanREE"),
+                       base_covs_for_HV = c("Age", "Sex", "Educ", "Hipp_ICV", "Mag_HippICV", "RIN", "AffyPlate.meanREE", 'SITE.meanREE'),
+                       cp_covs = ct_ana
+                       )
+adni_assoc_df <- rbind(adni_assoc_me3, adni_assoc) %>% 
+  dplyr::select(XVar, YVar, ADJUST, SummDf) %>% 
+  unnest(SummDf) %>% 
+  filter(str_detect(term, XVar)) %>% 
+  group_by(XVar, ADJUST) %>% 
+  mutate(q_local = p.adjust(p.value, "fdr"), .after = "p.value") %>% # this adjusts for number of genes/ME tested (n=21)
+  ungroup() %>% 
+  group_by(XVar) %>% 
+  mutate(q_global = p.adjust(p.value, "fdr"), .after = "q_local") %>% # this adjusts for numer of genes x adjustment tested (21*9)
+  ungroup()
+
+save(mcsa_assoc_me3, mcsa_assoc, adni_assoc_me3, adni_assoc, file = paste0(outdir, "/CBX_CPAdj_Assoc.RData"))
+```
+
+```{r meta-analysis}
+# perform meta-analysis
+meta_df = inner_join(mcsa_assoc_df, adni_assoc_df, by = c("XVar","YVar", "ADJUST", "term"), suffix = c("_MCSA", "_ADNI")) %>% 
+  mutate(rn = paste0(XVar, "_", YVar, "_", ADJUST)) %>% 
+  column_to_rownames("rn")
+
+# this indicates column indices corresponding to estimates and standard error of MCSA and ADNI
+eff_idx1 = which(colnames(meta_df) == "estimate_MCSA")
+eff_idx2 = which(colnames(meta_df) == "estimate_ADNI")
+err_idx1 = which(colnames(meta_df) == "std.error_MCSA")
+err_idx2 = which(colnames(meta_df) == "std.error_ADNI")
+
+# run meta-analysis using the function meta_gen_fn defined above
+meta_raw = meta_df %>% pbapply(1, meta_gen_fn, eff_idx1 = eff_idx1, eff_idx2 = eff_idx2, err_idx1 = err_idx1, err_idx2 = err_idx2)
+
+# Get all fixed-effect results
+fix_res = meta_raw %>%
+  pbsapply(function(x) x$fixed) %>%
+  t() %>%
+  as.data.frame() %>%
+  rename_with(~paste0(.x, "_fixed")) %>%
+  rownames_to_column(var = "rn") %>%
+  mutate_all(.funs = ~unlist(.x)) %>% 
+  mutate_all(.funs = ~unname(.x))
+
+# Get all random-effect results
+rand_res = meta_raw %>%
+  pbsapply(function(x) x$random) %>%
+  t() %>%
+  data.frame() %>%
+  rename_with(~paste0(.x, "_random")) %>%
+  rownames_to_column(var = "rn") %>%
+  mutate_all(.funs = ~unlist(.x)) %>%
+  mutate_all(.funs = ~unname(.x))
+
+# Get heterogenity meassurments Q, I2, tau2
+het_res = meta_raw %>%
+  map(~.x[c("Q","df.Q","pval.Q","I2", "lower.I2", "upper.I2", "tau2", "se.tau2", "H", "lower.H", "upper.H")]) %>%
+  bind_rows(.id = "rn")
+
+# Join the results to the original regression coeffcients
+meta_df = meta_df %>%
+  rownames_to_column(var = "rn") %>% 
+  inner_join(fix_res) %>%
+  inner_join(rand_res) %>% 
+  rename_with(~sub("^TE", "beta", .x), everything()) %>%
+  rename_with(~sub("^seTE", "se", .x), everything()) %>%
+  inner_join(het_res, by = "rn")
+
+# final meta-analyze dataframe, including adjusting for multiple test correction, determining meta-analyzed beta, p and q-values based on heterogeneity measures I2
+meta_CP_final = meta_df %>%
+  group_by(XVar, ADJUST) %>%
+  mutate(
+    q_local_random = p.adjust(p_random, method = "fdr"),
+    q_local_fixed = p.adjust(p_fixed, method = "fdr")
+  ) %>% # this adjusts for number of genes/ME tested (n=21)
+  ungroup() %>% 
+  group_by(XVar) %>% 
+  mutate(
+    q_global_random = p.adjust(p_random, method = "fdr"),
+    q_global_fixed = p.adjust(p_fixed, method = "fdr")
+  ) %>% # this adjusts for number of genes x adjustment tested (21*9)
+  ungroup() %>% 
+  mutate(model_meta = ifelse(I2 < 0.25, "Fixed", "Random"),
+         beta_meta = ifelse(model_meta =="Fixed", beta_fixed, beta_random),
+         se_meta = ifelse(model_meta =="Fixed", se_fixed, se_random),
+         p_meta = ifelse(model_meta =="Fixed", p_fixed, p_random),
+         q_local_meta = ifelse(model_meta =="Fixed", q_local_fixed, q_local_random),
+         q_global_meta = ifelse(model_meta =="Fixed", q_global_fixed, q_global_random),
+         CI_L_meta = ifelse(model_meta == "Fixed", lower_fixed, lower_random),
+         CI_H_meta = ifelse(model_meta =="Fixed", upper_fixed, upper_random)
+         ) %>%
+  dplyr::select(-c(ends_with("_random"), ends_with("_fixed"))) %>% 
+  dplyr::select(-rn, -term)
+write.xlsx(meta_CP_final, paste0(outdir, "/CBX_meta_CPAdj_final.xlsx"))
+
+rm(meta_df, fix_res, rand_res, het_res, meta_raw, eff_idx1, eff_idx2, err_idx1, err_idx2)
+```
+
+```{r plot the results}
+# plot the meta-analyzed results
+# prepare dataframe for plotting
+plot_df <- meta_CP_final %>%
+  dplyr::select(XVar:estimate_MCSA, p.value_MCSA:q_global_MCSA, estimate_ADNI, p.value_ADNI:q_global_ADNI, beta_meta, p_meta:q_global_meta) %>% 
+  dplyr::rename(
+    estimate_meta = beta_meta,
+    p.value_meta = p_meta,
+    ) %>%
+  pivot_longer(
+    cols = ends_with(c("_MCSA" , "_ADNI" , "_meta")),
+    names_to = "name",
+    values_to = "value"
+  ) %>%
+  separate(
+    name,
+    into = c("stat", "Cohort"),
+    sep = "_(?=[^_]+$)",
+    extra = "merge"
+  ) %>%
+  pivot_wider(
+    names_from = stat,
+    values_from = value
+  ) %>% 
+  mutate(XVar=factor(XVar, levels=c("Memory", "LMDR", "HippVol")),
+         ADJUST = factor(ADJUST, levels = c("None", "All", ct_ana)),
+         Cohort = ifelse(Cohort=="meta", "Meta-analyzed", Cohort),
+         Cohort = factor(Cohort, levels=c("MCSA", "ADNI","Meta-analyzed")),
+         lbl = if_else(q_global<0.05, "✱✱",  ""), 
+         lbl = if_else(q_local<0.05 & q_global > 0.05, "✱", lbl), 
+         lbl = if_else(p.value<0.05 & q_local>0.05,"Δ", lbl)
+         )
+
+cairo_pdf(paste0(outdir, "/CBX_assoc_adjustbyCP.pdf"), width = 10, height = 6.5, onefile = T)
+plot_df %>% 
+  filter(Cohort == "Meta-analyzed") %>% 
+  ggplot(aes(x=ADJUST, y=YVar)) +
+  geom_point(shape=21, color="black", aes(fill=estimate, size = -log(p.value))) +
+  geom_text(aes(label=lbl), size=9/.pt) +
+  scale_fill_gradient2(low = "blue", high = "red", mid = "white", midpoint = 0, name=expression(beta))+
+  #scale_size_continuous(range = c(2,10)) + 
+  scale_y_discrete(limits = rev) +
+  labs(
+    x = "Adjustment",
+    caption = "Δ:P<0.05; ✱:local q<0.05; ✱✱:global q<0.05") +
+  facet_grid(.~XVar) +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.y = element_text(face = "italic"),
+        axis.text.x = element_text(angle = 30, hjust = 1),
+        axis.title.y = element_blank(),
+        strip.background = element_rect(colour = "black"),
+        legend.key.size = unit(0.1,"in"),
+        text = element_text(family = "ArialMT"))
+dev.off()
+```
+
+```{r plot the correlations b/w estimates}
+plot_df2 <- plot_df %>% 
+  filter(ADJUST == "None") %>% 
+  dplyr::select(XVar:estimate) %>% 
+  dplyr::rename(est_original = estimate) %>% 
+  dplyr::select(-ADJUST) %>% 
+  left_join(
+    plot_df %>% 
+      filter(ADJUST != "None") %>% 
+      dplyr::select(XVar:estimate) %>% 
+      dplyr::rename(est_new = estimate)
+  )
+
+pdf(paste0(outdir, "/CBX_CPAdjAssocEst_corr_.pdf"), width = 7.25, height = 3, onefile = T)
+plot_df2 %>%
+  filter(Cohort == "Meta-analyzed" & YVar != "ME3") %>% 
+  ggplot(aes(x = est_original, y = est_new)) +
+  geom_point() + 
+  geom_smooth(method = "lm") +
+  geom_abline(intercept = 0, slope = 1, color = "red", linetype = "dashed") +
+  facet_grid(XVar ~ ADJUST, scales = "free") +
+  # Add correlation coefficient (r) and p-value
+  stat_cor(
+    method = "pearson",
+    label.x.npc = "left",   # position (can be "left", "right", etc.)
+    label.y.npc = "top",
+    label.sep = "\n",
+    size = 7/.pt
+  ) +
+  theme_bw(base_size = 10) +
+  theme(axis.text.x = element_text(angle=25, vjust=1))
+dev.off() # this is extended data fig.14b
+
+```
+
+
+## Longitudinal association
+```{r prepare input files for longitudinal association}
+# load in longitudinal files of mcsa and adni
+  # for both files, rows are donors, and there are at least two or more rows per donor because there are data from different time point.
+  # columns are cognitive endophenotypes/hippcampal volume at each time point. 
+  # there is also a column of difference in years of each time point from the baseline. 
+  # and there are columns of demographic information including sex, education yrs, age at baseline, intracranial volume or MRI magnetic field
+mcsa_long <- read.csv(paste0(indir,"/mcsa_long.csv")) %>% mutate(SubjectID = as.character(SubjectID))
+adni_long <- read.csv(paste0(indir, "/adni_long.csv"))
+
+# check for each subject, how many missing across visits there are for different endophenotypes 
+mcsa_na_check = mcsa_long %>% group_by(SubjectID) %>% summarise_all(list(~sum(!is.na(.))))
+adni_na_check = adni_long %>% group_by(SubjectID) %>% summarise_all(list(~sum(!is.na(.))))
+
+
+comRes <- readRDS(paste0(residir, "/comRes.rds")) # from 1_CreateResids.R
+
+# Prepare association input files
+cp4longassoc_mcsa <- mcsa_long %>% 
+  dplyr::select(SubjectID, YrDiff, Sex, Educ, Age_bl, APOE4, LMDR, Memory, HippVol, ICV) %>% 
+  left_join(
+    mcsa_cp_clr %>% cbind(comTrait[1:105, ] %>% rownames_to_column("SubjectID") %>% dplyr::select(SubjectID))
+  ) %>%
+  left_join(comRes[1:105, ] %>% as.data.frame() %>% rownames_to_column("SubjectID") %>% dplyr::select(SubjectID, any_of(nduf_bb$gene_id))) %>% 
+  rename_with(~ nduf_bb$gene_name[match(.x, nduf_bb$gene_id)], .cols = any_of(nduf_bb$gene_id))
+
+cp4longassoc_adni <- adni_long %>% 
+  dplyr::select(SubjectID, YrDiff, Sex, Educ, Age_bl, APOE4, LMDR, Memory, HippVol, ICV, Mag) %>% 
+  mutate(Mag = factor(Mag)) %>% 
+  left_join(
+    adni_cp_clr %>% cbind(comTrait[106:196, ] %>% rownames_to_column("SubjectID") %>% dplyr::select(SubjectID))
+  ) %>%
+  left_join(comRes[106:196, ] %>% as.data.frame() %>% rownames_to_column("SubjectID") %>% dplyr::select(SubjectID, any_of(nduf_bb$gene_id))) %>% 
+  rename_with(~ nduf_bb$gene_name[match(.x, nduf_bb$gene_id)], .cols = any_of(nduf_bb$gene_id))
+
+```
+
+```{r associations functions}
+# functions for performing associations for:
+# 1) no adjustment (the original model);
+# 2) adjust for all analyzed cell proportions;
+# 3) adjust for one cell proportion at a time
+long_assoc_fn <- function(df,
+                          na_check_df,
+                          xvars,
+                          yvars,
+                          adjust_types,
+                          base_covs,
+                          base_covs_for_HV,
+                          cp_covs
+                          ){
+  run_assoc <- function(xvar, yvar, adjustment){
+    message("Test association between ", xvar, " and ", yvar, " adjusting for ", adjustment)
+    # no cell type prportion adjustment
+    if (adjustment == "None"){
+      if (yvar %in% c("Memory", "LMDR")){
+        inputdf <- df %>% filter(! SubjectID %in% na_check_df$SubjectID[which(na_check_df[[yvar]]<=1)])
+        m <- lmer(paste0(yvar, " ~ ", xvar, "*YrDiff", " + ", paste0(base_covs, collapse = " + "), " + (1 + YrDiff|SubjectID)"), data = inputdf)
+      }
+      else if (yvar == "HippVol"){
+        inputdf <- df %>% filter(! SubjectID %in% na_check_df$SubjectID[which(na_check_df[[yvar]]<=1)])
+        m <- lmer(paste0(yvar, " ~ ", xvar, "*YrDiff", " + ", paste0(base_covs_for_HV, collapse = " + "), " + (1 + YrDiff|SubjectID)"), data = inputdf)
+      }
+    }
+    # adjust for all cell type proportions
+    else if (adjustment == "All"){
+      if (yvar %in% c("Memory", "LMDR")){
+        inputdf <- df %>% filter(! SubjectID %in% na_check_df$SubjectID[which(na_check_df[[yvar]]<=1)])
+        m <- lmer(paste0(yvar, " ~ ", xvar, "*YrDiff", " + ", paste0(c(base_covs, cp_covs), collapse = " + "), " + (1 + YrDiff|SubjectID)"), data = inputdf)
+      }
+      else if (yvar == "HippVol"){
+        inputdf <- df %>% filter(! SubjectID %in% na_check_df$SubjectID[which(na_check_df[[yvar]]<=1)])
+        m <- lmer(paste0(yvar, " ~ ", xvar, "*YrDiff", " + ", paste0(c(base_covs_for_HV, cp_covs), collapse = " + "), " + (1 + YrDiff|SubjectID)"), data = inputdf)
+      }
+    }
+    # adjust for one cell type proportion at a time
+    else if (adjustment %in% c(cp_covs)){
+      if (yvar %in% c("Memory", "LMDR")){
+        inputdf <- df %>% filter(! SubjectID %in% na_check_df$SubjectID[which(na_check_df[[yvar]]<=1)])
+        m <- lmer(paste0(yvar, " ~ ", xvar, "*YrDiff", " + ", paste0(c(base_covs, adjustment), collapse = " + "), " + (1 + YrDiff|SubjectID)"), data = inputdf)
+      }
+      else if (yvar == "HippVol"){
+        inputdf <- df %>% filter(! SubjectID %in% na_check_df$SubjectID[which(na_check_df[[yvar]]<=1)])
+        m <- lmer(paste0(yvar, " ~ ", xvar, "*YrDiff", " + ", paste0(c(base_covs_for_HV, adjustment), collapse = " + "), " + (1 + YrDiff|SubjectID)"), data = inputdf)
+      }
+    }
+    
+    res_df <- tidy(m, conf.int = T)
+    
+    tbl <- tibble(
+      Model = list(m),
+      SummDf = list(res_df)
+    )
+    return(tbl)
+  }
+  
+  # Run for all combinations
+  results <- expand.grid(
+    XVar = xvars,
+    YVar = yvars,
+    ADJUST = adjust_types,
+    stringsAsFactors = F
+  ) %>%
+  mutate(result = pmap(list(XVar, YVar, ADJUST),
+                       ~ run_assoc(..1, ..2, ..3))) %>%
+  unnest(result)
+  
+  return(results)
+}
+```
+
+```{r run longitudinal assoc}
+mcsa_longassoc <- long_assoc_fn(df = cp4longassoc_mcsa,
+                                na_check_df = mcsa_na_check,
+                                yvars = c("Memory", "LMDR", "HippVol"),
+                                xvars = c(nduf_bb$gene_name),
+                                adjust_types = c("None", "All", ct_ana),
+                                base_covs = c("Age_bl", "Sex", "Educ"),
+                                base_covs_for_HV = c("Age_bl", "Sex", "Educ", "ICV"),
+                                cp_covs = ct_ana
+                                )
+mcsa_longassoc_df <- mcsa_longassoc %>% 
+  dplyr::select(XVar, YVar, ADJUST, SummDf) %>% 
+  unnest(SummDf) %>% 
+  filter(str_detect(term, ":")) %>% 
+  group_by(YVar, ADJUST) %>% 
+  mutate(q_local = p.adjust(p.value, "fdr"), .after = "p.value") %>% # this adjusts for number of genes/ME tested (n=20)
+  ungroup() %>% 
+  group_by(YVar) %>% 
+  mutate(q_global = p.adjust(p.value, "fdr"), .after = "q_local") %>% # this adjusts for numer of genes x adjustment tested (20*9)
+  ungroup() %>% 
+  dplyr::select(-effect, -group)
+
+adni_longassoc <- long_assoc_fn(df = cp4longassoc_adni,
+                                na_check_df = adni_na_check,
+                                yvars = c("Memory", "LMDR", "HippVol"),
+                                xvars = c(nduf_bb$gene_name),
+                                adjust_types = c("None", "All", ct_ana),
+                                base_covs = c("Age_bl", "Sex", "Educ"),
+                                base_covs_for_HV = c("Age_bl", "Sex", "Educ", "ICV", "Mag"),
+                                cp_covs = ct_ana
+                                )
+adni_longassoc_df <- adni_longassoc %>% 
+  dplyr::select(XVar, YVar, ADJUST, SummDf) %>% 
+  unnest(SummDf) %>% 
+  filter(str_detect(term, ":")) %>% 
+  group_by(YVar, ADJUST) %>% 
+  mutate(q_local = p.adjust(p.value, "fdr"), .after = "p.value") %>% # this adjusts for number of genes/ME tested (n=20)
+  ungroup() %>% 
+  group_by(YVar) %>% 
+  mutate(q_global = p.adjust(p.value, "fdr"), .after = "q_local") %>% # this adjusts for numer of genes x adjustment tested (20*9)
+  ungroup()
+
+save(mcsa_longassoc, adni_longassoc, file = paste0(outdir, "/CBX_CPAdj_LongAssoc.RData"))
+```
+
+```{r longitudinal meta-analysis}
+meta_df = inner_join(mcsa_longassoc_df, adni_longassoc_df, by = c("XVar","YVar", "ADJUST", "term"), suffix = c("_MCSA", "_ADNI")) %>% 
+  mutate(rn = paste0(XVar, "_", YVar, "_", ADJUST)) %>% 
+  column_to_rownames("rn")
+
+# this indicates column indices corresponding to estimates and standard error of MCSA and ADNI
+eff_idx1 = which(colnames(meta_df) == "estimate_MCSA")
+eff_idx2 = which(colnames(meta_df) == "estimate_ADNI")
+err_idx1 = which(colnames(meta_df) == "std.error_MCSA")
+err_idx2 = which(colnames(meta_df) == "std.error_ADNI")
+
+# run meta-analysis using the function meta_gen_fn defined above
+meta_raw = meta_df %>% pbapply(1, meta_gen_fn, eff_idx1 = eff_idx1, eff_idx2 = eff_idx2, err_idx1 = err_idx1, err_idx2 = err_idx2)
+
+# Get all fixed-effect results
+fix_res = meta_raw %>%
+  pbsapply(function(x) x$fixed) %>%
+  t() %>%
+  as.data.frame() %>%
+  rename_with(~paste0(.x, "_fixed")) %>%
+  rownames_to_column(var = "rn") %>%
+  mutate_all(.funs = ~unlist(.x)) %>% 
+  mutate_all(.funs = ~unname(.x))
+
+# Get all random-effect results
+rand_res = meta_raw %>%
+  pbsapply(function(x) x$random) %>%
+  t() %>%
+  data.frame() %>%
+  rename_with(~paste0(.x, "_random")) %>%
+  rownames_to_column(var = "rn") %>%
+  mutate_all(.funs = ~unlist(.x)) %>%
+  mutate_all(.funs = ~unname(.x))
+
+# Get heterogenity meassurments Q, I2, tau2
+het_res = meta_raw %>%
+  map(~.x[c("Q","df.Q","pval.Q","I2", "lower.I2", "upper.I2", "tau2", "se.tau2", "H", "lower.H", "upper.H")]) %>%
+  bind_rows(.id = "rn")
+
+# Join the results to the original regression coeffcients
+meta_df = meta_df %>%
+  rownames_to_column(var = "rn") %>% 
+  inner_join(fix_res) %>%
+  inner_join(rand_res) %>% 
+  rename_with(~sub("^TE", "beta", .x), everything()) %>%
+  rename_with(~sub("^seTE", "se", .x), everything()) %>%
+  inner_join(het_res, by = "rn")
+
+# final meta-analyze dataframe, including adjusting for multiple test correction, determining meta-analyzed beta, p and q-values based on heterogeneity measures I2
+meta_CP_long_final = meta_df %>%
+  group_by(YVar, ADJUST) %>%
+  mutate(
+    q_local_random = p.adjust(p_random, method = "fdr"),
+    q_local_fixed = p.adjust(p_fixed, method = "fdr")
+  ) %>% # this adjusts for number of genes/ME tested (n=21)
+  ungroup() %>% 
+  group_by(YVar) %>% 
+  mutate(
+    q_global_random = p.adjust(p_random, method = "fdr"),
+    q_global_fixed = p.adjust(p_fixed, method = "fdr")
+  ) %>% # this adjusts for numer of genes x adjustment tested (21*9)
+  ungroup() %>% 
+  mutate(model_meta = ifelse(I2 < 0.25, "Fixed", "Random"),
+         beta_meta = ifelse(model_meta =="Fixed", beta_fixed, beta_random),
+         se_meta = ifelse(model_meta =="Fixed", se_fixed, se_random),
+         p_meta = ifelse(model_meta =="Fixed", p_fixed, p_random),
+         q_local_meta = ifelse(model_meta =="Fixed", q_local_fixed, q_local_random),
+         q_global_meta = ifelse(model_meta =="Fixed", q_global_fixed, q_global_random),
+         CI_L_meta = ifelse(model_meta == "Fixed", lower_fixed, lower_random),
+         CI_H_meta = ifelse(model_meta =="Fixed", upper_fixed, upper_random)
+         ) %>%
+  dplyr::select(-c(ends_with("_random"), ends_with("_fixed"))) %>% 
+  dplyr::select(-rn, -term)
+write.xlsx(meta_CP_long_final, paste0(outdir, "/CBX_meta_CPAdj_long_final.xlsx"))
+
+rm(meta_df, fix_res, rand_res, het_res, meta_raw, eff_idx1, eff_idx2, err_idx1, err_idx2)
+```
+
+```{r longitudinal: plot the results}
+plot_df <- meta_CP_long_final %>%
+  dplyr::select(XVar:estimate_MCSA, p.value_MCSA:q_global_MCSA, estimate_ADNI, p.value_ADNI:q_global_ADNI, beta_meta, p_meta:q_global_meta) %>% 
+  dplyr::rename(
+    estimate_meta = beta_meta,
+    p.value_meta = p_meta,
+    ) %>%
+  pivot_longer(
+    cols = ends_with(c("_MCSA" , "_ADNI" , "_meta")),
+    names_to = "name",
+    values_to = "value"
+  ) %>%
+  separate(
+    name,
+    into = c("stat", "Cohort"),
+    sep = "_(?=[^_]+$)",
+    extra = "merge"
+  ) %>%
+  pivot_wider(
+    names_from = stat,
+    values_from = value
+  ) %>% 
+  mutate(YVar=factor(YVar, levels=c("Memory", "LMDR", "HippVol")),
+         ADJUST = factor(ADJUST, levels = c("None", "All", ct_ana)),
+         Cohort = ifelse(Cohort=="meta", "Meta-analyzed", Cohort),
+         Cohort = factor(Cohort, levels=c("MCSA", "ADNI","Meta-analyzed")),
+         lbl = if_else(q_global<0.05, "✱✱",  ""), 
+         lbl = if_else(q_local<0.05 & q_global > 0.05, "✱", lbl), 
+         lbl = if_else(p.value<0.05 & q_local>0.05,"Δ", lbl)
+         )
+
+
+cairo_pdf(paste0(outdir, "/CBX_longassoc_adjustbyCP.pdf"), width = 10, height = 6.5, onefile = T)
+plot_df %>% 
+  filter(Cohort == "Meta-analyzed") %>% 
+  ggplot(aes(x=ADJUST, y=XVar)) +
+  geom_point(shape=21, color="black", aes(fill=estimate, size = -log(p.value))) +
+  geom_text(aes(label=lbl), size=9.5/.pt) +
+  scale_fill_gradient2(low = "blue", high = "red", mid = "white", midpoint = 0, name=expression(beta))+
+  #scale_size_continuous(range = c(2,10)) + 
+  scale_y_discrete(limits = rev) +
+  labs(
+    x = "Adjustment",
+    caption = "Δ:P<0.05; ✱:local q<0.05; ✱✱:global q<0.05") +
+  facet_grid(.~YVar) +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.y = element_text(face = "italic"),
+        axis.text.x = element_text(angle = 30, hjust = 1),
+        axis.title.y = element_blank(),
+        strip.background = element_rect(colour = "black"),
+        legend.key.size = unit(0.1,"in"),
+        text = element_text(family = "ArialMT"))
+dev.off() # this is extended data fig.16a
+```
+
+```{r longitudinal: plot the correlations b/w estimates}
+plot_df2 <- plot_df %>% 
+  filter(ADJUST == "None") %>% 
+  dplyr::select(XVar:estimate) %>% 
+  dplyr::rename(est_original = estimate) %>% 
+  dplyr::select(-ADJUST) %>% 
+  left_join(
+    plot_df %>% 
+      filter(ADJUST != "None") %>% 
+      dplyr::select(XVar:estimate) %>% 
+      dplyr::rename(est_new = estimate)
+  )
+
+pdf(paste0(outdir, "/CBX_CPAdjlong_est_corr.pdf"), width = 7.25, height = 3, onefile = T)
+plot_df2 %>%
+  filter(Cohort == "Meta-analyzed") %>% 
+  ggplot(aes(x = est_original, y = est_new)) +
+  geom_point() + 
+  geom_smooth(method = "lm") +
+  geom_abline(intercept = 0, slope = 1, color = "red", linetype = "dashed") +
+  facet_grid(YVar ~ ADJUST, scales = "free") +
+  theme_bw(base_size = 10) +
+  theme(axis.text.x = element_text(angle=25, vjust=1))
+dev.off() # this is extended data fig.16b
+```
+
+
+# Cell-specific gene expression analysis
+## Prepare dataframes
+- For high resolution gene expression (GE) files, need to remove genes that were either “NA” or “1”, or had the same deconvoluted expression values across all samples, which indicated insufficient evidence of estimation. (https://www.nature.com/articles/s41598-023-44183-7#Sec11).
+- The resulting GE files from CIBERSORTx are in non-log space so we performed log2 transformation.
+```{r}
+mcsa_gep_filepath <- list.files(path = paste0(indir,"/CBXHiRes_upload"), pattern="^CIBERSORTxHiRes_R01_", full.names = T) # the file format is each column is subject and each row is a gene
+mcsa_gep_filepath <- mcsa_gep_filepath[-c(2,3,8)] #remove path to GE files of cell types not analyzed
+
+adni_gep_filepath <- list.files(path = paste0(indir,"/CBXHiRes_upload"), pattern="^CIBERSORTxHiRes_ADNI_s91_", full.names = T)
+adni_gep_filepath <- adni_gep_filepath[-c(2,3,8)] #remove path to GE files of cell types not analyzed
+
+# readFile: to read all the .txt files in the specified path
+readFile <- function(f) {df <- read_delim(file = f, delim = "\t")}
+# read .txt files and prepare for association analysis
+mcsa_gep_ls <- lapply(mcsa_gep_filepath, readFile)
+names(mcsa_gep_ls) <- c("Bcells", "Mast", "Monocytes", "Neutrophils", "NK", "CD4T", "CD8T")
+mcsa_gep_clean <- mcsa_gep_ls %>% 
+  map(~ filter(.x, GeneSymbol %in% nduf_bb$gene_name)) %>% 
+  map(~ rowwise(.x)) %>% 
+  map(~filter(.x, n_distinct(c_across(-1), na.rm = TRUE) > 1)) %>%
+  map(~mutate(.x, across(2:ncol(.x), ~ log2(.x)))) %>% 
+  keep(~ nrow(.x) > 0) %>% 
+  map(~ pivot_longer(.x, cols = 2:ncol(.x), names_to = "SubjectID", values_to = "GE")) %>% 
+  map(~ pivot_wider(.x, names_from = "GeneSymbol", values_from = "GE")) %>% 
+  map(~ left_join(.x,
+                    comTrait[1:105,] %>% 
+                       rownames_to_column("SubjectID") %>% 
+                       dplyr::select(SubjectID, Age, Sex, Educ, Memory, LMDR, HippVol, Hipp_ICV, Mag_HippICV))) %>% 
+  map(~ left_join(.x, 
+                    mcsa_covars %>% dplyr::select(SubjectID, RIN, PAXgene_flowcell, PAXgene_Batch)))
+# read .txt files and prepare for association analysis
+adni_gep_ls <- lapply(adni_gep_filepath, readFile)
+names(adni_gep_ls) <- c("Bcells", "Mast", "Monocytes", "Neutrophils", "NK", "CD4T", "CD8T")
+adni_gep_clean <- adni_gep_ls %>% 
+  map(~ rename_with(.x, ~ gsub("^X", "", .x), .cols = -1)) %>% 
+  map(~ filter(.x, GeneSymbol %in% nduf_bb$gene_name)) %>% 
+  map(~ rowwise(.x)) %>% 
+  map(~filter(.x, n_distinct(c_across(-1), na.rm = TRUE) > 1)) %>%
+  map(~mutate(.x, across(2:ncol(.x), ~ log2(.x)))) %>% 
+  keep(~ nrow(.x) > 0) %>% 
+  map(~ pivot_longer(.x, cols = 2:ncol(.x), names_to = "SubjectID", values_to = "GE")) %>% 
+  map(~ pivot_wider(.x, names_from = "GeneSymbol", values_from = "GE")) %>% 
+  map(~ left_join(.x,
+                   comTrait[106:196,] %>% 
+                       rownames_to_column("SubjectID") %>% 
+                       dplyr::select(SubjectID, Age, Sex, Educ, Memory, LMDR, HippVol, Hipp_ICV, Mag_HippICV) %>% 
+                       mutate(Mag_HippICV = factor(Mag_HippICV)))) %>% 
+  map(~ left_join(.x, 
+                     adni_covars %>% dplyr::select(SubjectID, RIN, AffyPlate.meanREE, SITE.meanREE)))
+```
+
+## Run cell-specific associations
+```{r HiResGEP: assoc}
+mcsa_gep_results <- list()
+for (ct in names(mcsa_gep_clean)){
+  data = mcsa_gep_clean[[ct]]
+  ndufs_in_mx = intersect(names(data), nduf_bb$gene_name)
+  
+  results <- assoc_fn(df = data, 
+                      xvars = c("Memory", "LMDR", "HippVol"),
+                      yvars = ndufs_in_mx,
+                      adjust_types = "None",
+                      base_covs = c("Age", "Sex", "Educ", "RIN", "PAXgene_flowcell", "PAXgene_Batch"),
+                      base_covs_for_HV = c("Age", "Sex", "Educ", "Hipp_ICV", "RIN", "PAXgene_flowcell", "PAXgene_Batch"),
+                      cp_covs = NULL)
+  results <- results %>% dplyr::select(-ADJUST)
+  
+  mcsa_gep_results[[ct]] <- results
+}
+mcsa_gep_results <- bind_rows(mcsa_gep_results, .id = "CellType")
+rm(ct, data, ndufs_in_mx, results)
+
+mcsa_gep_df <- mcsa_gep_results %>% 
+  dplyr::select(CellType, XVar, YVar, SummDf) %>% 
+  unnest(SummDf) %>% 
+  filter(str_detect(term, XVar)) %>% 
+  group_by(XVar, CellType) %>% 
+  mutate(q_local = p.adjust(p.value, "fdr"), .after = "p.value") %>% # this adjusts for number of genes tested in each cell type
+  ungroup() %>% 
+  group_by(XVar) %>% 
+  mutate(q_global = p.adjust(p.value, "fdr"), .after = "q_local") %>% # this adjusts for number of genes x cell types tested
+  ungroup()
+
+adni_gep_results <- list()
+for (ct in names(adni_gep_clean)){
+  data = adni_gep_clean[[ct]]
+  ndufs_in_mx = intersect(names(data), nduf_bb$gene_name)
+  
+  results <- assoc_fn(df = data, 
+                      xvars = c("Memory", "LMDR", "HippVol"),
+                      yvars = ndufs_in_mx,
+                      adjust_types = "None",
+                      base_covs = c("Age", "Sex", "Educ", "RIN", "AffyPlate.meanREE", "SITE.meanREE"),
+                      base_covs_for_HV = c("Age", "Sex", "Educ", "Hipp_ICV", "Mag_HippICV", "RIN", "AffyPlate.meanREE", 'SITE.meanREE'),
+                      cp_covs = NULL)
+  results <- results %>% dplyr::select(-ADJUST)
+  
+  adni_gep_results[[ct]] <- results
+}
+adni_gep_results <- bind_rows(adni_gep_results, .id = "CellType")
+rm(ct, data, ndufs_in_mx, results)
+adni_gep_df <- adni_gep_results %>% 
+  dplyr::select(CellType, XVar, YVar, SummDf) %>% 
+  unnest(SummDf) %>% 
+  filter(str_detect(term, XVar)) %>% 
+  group_by(XVar, CellType) %>% 
+  mutate(q_local = p.adjust(p.value, "fdr"), .after = "p.value") %>% # this adjusts for number of genes tested in each cell type
+  ungroup() %>% 
+  group_by(XVar) %>% 
+  mutate(q_global = p.adjust(p.value, "fdr"), .after = "q_local") %>% # this adjusts for number of genes x cell types tested
+  ungroup()
+
+save(mcsa_gep_results, adni_gep_results, file = paste0(outdir, "/HiResGEP_Results.RData"))
+```
+
+```{r HiResGEP: meta-analysis}
+meta_df = inner_join(mcsa_gep_df, adni_gep_df, by = c("CellType", "XVar","YVar", "term"), suffix = c("_MCSA", "_ADNI")) %>% 
+  mutate(rn = paste0(CellType, "_", XVar, "_", YVar, "_")) %>% 
+  column_to_rownames("rn")
+
+# this indicates column indices corresponding to estimates and standard error of MCSA and ADNI
+eff_idx1 = which(colnames(meta_df) == "estimate_MCSA")
+eff_idx2 = which(colnames(meta_df) == "estimate_ADNI")
+err_idx1 = which(colnames(meta_df) == "std.error_MCSA")
+err_idx2 = which(colnames(meta_df) == "std.error_ADNI")
+
+# run meta-analysis using the function meta_gen_fn defined above
+meta_raw = meta_df %>% pbapply(1, meta_gen_fn, eff_idx1 = eff_idx1, eff_idx2 = eff_idx2, err_idx1 = err_idx1, err_idx2 = err_idx2)
+
+# Get all fixed-effect results
+fix_res = meta_raw %>%
+  pbsapply(function(x) x$fixed) %>%
+  t() %>%
+  as.data.frame() %>%
+  rename_with(~paste0(.x, "_fixed")) %>%
+  rownames_to_column(var = "rn") %>%
+  mutate_all(.funs = ~unlist(.x)) %>% 
+  mutate_all(.funs = ~unname(.x))
+
+# Get all random-effect results
+rand_res = meta_raw %>%
+  pbsapply(function(x) x$random) %>%
+  t() %>%
+  data.frame() %>%
+  rename_with(~paste0(.x, "_random")) %>%
+  rownames_to_column(var = "rn") %>%
+  mutate_all(.funs = ~unlist(.x)) %>%
+  mutate_all(.funs = ~unname(.x))
+
+# Get heterogenity meassurments Q, I2, tau2
+het_res = meta_raw %>%
+  map(~.x[c("Q","df.Q","pval.Q","I2", "lower.I2", "upper.I2", "tau2", "se.tau2", "H", "lower.H", "upper.H")]) %>%
+  bind_rows(.id = "rn")
+
+# Join the results to the original regression coeffcients
+meta_df = meta_df %>%
+  rownames_to_column(var = "rn") %>% 
+  inner_join(fix_res) %>%
+  inner_join(rand_res) %>% 
+  rename_with(~sub("^TE", "beta", .x), everything()) %>%
+  rename_with(~sub("^seTE", "se", .x), everything()) %>%
+  inner_join(het_res, by = "rn")
+
+# final meta-analyze dataframe, including adjusting for multiple test correction, determining meta-analyzed beta, p and q-values based on heterogeneity measures I2
+meta_gep_final = meta_df %>%
+  group_by(XVar, CellType) %>%
+  mutate(
+    q_local_random = p.adjust(p_random, method = "fdr"),
+    q_local_fixed = p.adjust(p_fixed, method = "fdr")
+  ) %>% # this adjusts for number of genes/ME tested (n=21)
+  ungroup() %>% 
+  group_by(XVar) %>% 
+  mutate(
+    q_global_random = p.adjust(p_random, method = "fdr"),
+    q_global_fixed = p.adjust(p_fixed, method = "fdr")
+  ) %>% # this adjusts for numer of genes x adjustment tested (21*7)
+  ungroup() %>% 
+  mutate(model_meta = ifelse(I2 < 0.25, "Fixed", "Random"),
+         beta_meta = ifelse(model_meta =="Fixed", beta_fixed, beta_random),
+         se_meta = ifelse(model_meta =="Fixed", se_fixed, se_random),
+         p_meta = ifelse(model_meta =="Fixed", p_fixed, p_random),
+         q_local_meta = ifelse(model_meta =="Fixed", q_local_fixed, q_local_random),
+         q_global_meta = ifelse(model_meta =="Fixed", q_global_fixed, q_global_random),
+         CI_L_meta = ifelse(model_meta == "Fixed", lower_fixed, lower_random),
+         CI_H_meta = ifelse(model_meta =="Fixed", upper_fixed, upper_random)
+         ) %>%
+  dplyr::select(-c(ends_with("_random"), ends_with("_fixed"))) %>% 
+  dplyr::select(-rn, -term)
+write.xlsx(meta_gep_final, paste0(outdir, "/CBX_meta_gep_final.xlsx")) # this is in supplementary table 13b
+
+rm(meta_df, fix_res, rand_res, het_res, meta_raw, eff_idx1, eff_idx2, err_idx1, err_idx2)
+```
+
+```{r HiRes: plot the meta-analyzed GEP results}
+plot_df <- meta_gep_final %>%
+  dplyr::select(CellType:estimate_MCSA, p.value_MCSA:q_global_MCSA, estimate_ADNI, p.value_ADNI:q_global_ADNI, beta_meta, p_meta:q_global_meta) %>% 
+  dplyr::rename(
+    estimate_meta = beta_meta,
+    p.value_meta = p_meta,
+    ) %>%
+  pivot_longer(
+    cols = ends_with(c("_MCSA" , "_ADNI" , "_meta")),
+    names_to = "name",
+    values_to = "value"
+  ) %>%
+  separate(
+    name,
+    into = c("stat", "Cohort"),
+    sep = "_(?=[^_]+$)",
+    extra = "merge"
+  ) %>%
+  pivot_wider(
+    names_from = stat,
+    values_from = value
+  ) %>% 
+  mutate(XVar=factor(XVar, levels=c("Memory", "LMDR", "HippVol")),
+         Cohort = ifelse(Cohort=="meta", "Meta-analyzed", Cohort),
+         Cohort = factor(Cohort, levels=c("MCSA", "ADNI","Meta-analyzed")),
+         lbl = if_else(q_global<0.05, "✱✱",  ""), 
+         lbl = if_else(q_local<0.05 & q_global > 0.05, "✱", lbl), 
+         lbl = if_else(p.value<0.05 & q_local>0.05,"Δ", lbl)
+         )
+
+
+cairo_pdf(paste0(outdir, "/CBX_GEPAssoc.pdf"), width = 6, height = 4.5)
+plot_df %>% 
+  ggplot(aes(x=Cohort, y=YVar)) +
+  geom_point(shape=21, color="black", aes(fill=estimate, size = -log(p.value))) +
+  geom_text(aes(label=lbl), size=9.5/.pt) +
+  scale_fill_gradient2(low = "blue", high = "red", mid = "white", midpoint = 0, name=expression(beta))+
+  #scale_size_continuous(range = c(2,10)) + 
+  scale_y_discrete(limits = rev) +
+  labs(
+    x = "Adjustment",
+    caption = "Δ:P<0.05; ✱:local q<0.05; ✱✱:global q<0.05") +
+  facet_grid(CellType~XVar, scales = "free", space = "free") +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.y = element_text(face = "italic"),
+        axis.text.x = element_text(angle = 30, hjust = 1),
+        axis.title.y = element_blank(),
+        strip.background = element_rect(colour = "black"),
+        legend.key.size = unit(0.1,"in"),
+        text = element_text(family = "ArialMT"))
+dev.off() # this is in Extended Data fig.14c
+```

@@ -1,1 +1,317 @@
+---
+title: "rbt_1_1_new"
+output: html_document
+date: "2026-02-01"
+---
+
+Author: Wei (Adelyn) Tsai; [tsai.wei\@mayo.edu](mailto:tsai.wei@mayo.edu){.email}.
+
+If you are using this script, please cite our study.
+
+This script addresses comment 1 about cognitive resilience in the AMP-AD datasets from reviewer 1
+Please note that based on the 2nd rebuttal, cognitive resilience in the AMP-AD dataset results have been updated. Please see rebuttal_2nd/rbt_1_2.Rmd for more details.
+
+```{r}
+suppressPackageStartupMessages(library(tidyverse)) #v2.0.0
+suppressPackageStartupMessages(library(broom)) #v1.0.12
+suppressPackageStartupMessages(library(broom.mixed)) #v0.2.9
+suppressPackageStartupMessages(library(openxlsx)) #v4.2.8
+suppressPackageStartupMessages(library(lmerTest)) #v3.1
+suppressPackageStartupMessages(library(patchwork)) #v1.3.2
+
+source("./Codes/fns.R") #source a list of frequently used functions
+
+
+# list of input directories where files are
+indir <- "./indir"
+
+brwgcna_dir <-"./outdir/br_wgcna"
+nduf_assoc_dir <- "./outdir/nduf_assoc_de"
+
+# output directory
+outdir <- "./Rebuttal/outdir"
+```
+
+# Calculate cognitive resilience 
+```{r prepare files}
+comTrait_br <- readRDS(paste0(indir, "/comTrait_br.rds")) # a file with organized AMP-AD metadata
+rosmap_id <- read_delim(paste0(indir,"/ROSMAP_id_map.txt"), delim = "\t") %>% mutate(projid = as.character(projid)) # a file mapping between RNAseq SampleID and projid
+
+# Get cognitive scores, global pathology and education from RADC files. 
+radc_cs <- read.xlsx(paste0(indir,"/dataset_886_cross-sectional_11-20-2025.xlsx"))
+radc_long <- read.xlsx(paste0(indir,"/dataset_886_long_11-20-2025.xlsx"))
+# create a dataframe to be used for calculating cognitive resilience or cognitive decline resilience 
+radc_use <- comTrait_br %>% 
+  filter(Cohort == "ROSMAP") %>% 
+  left_join(rosmap_id, by="SampleID") %>% 
+  dplyr::select(SampleID, projid, everything()) %>% 
+  left_join(radc_cs %>% 
+              dplyr::select(projid, gpath, educ, cognep_demog_slope) %>%  #cognep_demog_slope = episodic memory domain score random slope
+              dplyr::rename(GlobalPath = gpath), by="projid") %>% 
+  left_join(radc_long %>%
+              dplyr::select(projid, cogn_ep, age_at_visit) %>% #cogn_ep = episodic memory domain score
+              group_by(projid) %>%
+              filter(!is.na(cogn_ep)) %>% 
+              slice_tail() # take the latest available cogn_ep; 
+              ) %>% 
+  column_to_rownames("SampleID")
+```
+Functions for performing regression
+```{r}
+linear_fn <- function(data_df,
+                     XVars,
+                     YVars, 
+                     base_covs,
+                     random_var,
+                     mode = c("linear", "linear mixed")){
+  run_assoc <- function(xvar, yvar){
+    message(xvar, " and ", yvar)
+    
+    if (mode == "linear"){
+      m <- lm(paste0(yvar, " ~ ", xvar, " + ", paste0(base_covs, collapse = " + ")), data = data_df)
+      res_df <- broom::tidy(m, conf.int = T)
+      
+    }
+    else if (mode == "linear mixed"){
+      m <- lmer(paste0(yvar, " ~ ", xvar, " + ", paste0(base_covs, collapse = " + "), " + ", "(1|", random_var, ")"), data = data_df)
+      res_df <- broom.mixed::tidy(m, conf.int = T)
+    }
+    
+
+    tbl <- tibble(
+      Model = list(m),
+      SummDf = list(res_df)
+    )
+    return(tbl)
+  }
+  
+  # Run for all combinations
+  results <- expand.grid(
+    X = XVars,
+    Y = YVars,
+    stringsAsFactors = F
+  ) %>%
+    mutate(result = pmap(list(X, Y),
+                         ~ run_assoc(..1, ..2))) %>%
+    unnest(result)
+  
+  return(results)
+}
+```
+
+
+Calculate cognitive resilience (CR) by linear regression of cogn_ep adjusting for different pathology, age at visit and sex (Sex_M1F0, male = 1 and female = 0)
+Calculate cognitive decline resilience (CDR) by linear regression of cognep_demog_slope adjusting for different pathology
+```{r calculate CR/CDR}
+cr_ls <- list()
+for (p in c("Braak", "Thal", "GlobalPath")){
+  cr_ls[[p]] <- as.data.frame(lm(paste0("cogn_ep ~", p, " + age_at_visit + Sex_M1F0 + educ"), data=radc_use)$residuals) %>% 
+    rownames_to_column("SampleID") %>% 
+    dplyr::rename(CR=2)
+}
+
+cdr_ls <- list()
+for (p in c("Braak", "Thal", "GlobalPath")){
+  cdr_ls[[p]] <- as.data.frame(lm(paste0("cognep_demog_slope ~", p), data=radc_use)$residuals) %>% 
+    rownames_to_column("SampleID") %>% 
+    dplyr::rename(CDR=2)
+}
+# create an inputdf containing demographic and sequencing varaiables that will be used for regression analysis between NDUFs and CR/CDR
+inputdf <- bind_rows(cr_ls, .id = "Pathology") %>% 
+  pivot_wider(names_from = "Pathology", values_from = "CR") %>% 
+  left_join(bind_rows(cdr_ls, .id = "Pathology") %>% 
+               pivot_wider(names_from = "Pathology", values_from = "CDR"), by = "SampleID", suffix = c("_CR", "_CDR")) %>% 
+  left_join(
+    radc_use %>% 
+      rownames_to_column("SampleID") %>% 
+      dplyr::select(SampleID, projid, RIN, Batch, Source, AOD, Sex_M1F0, ApoE)
+  ) %>% 
+  mutate(
+    APOE4 = case_when(
+      ApoE %in% c("22", "23", "33") ~ 0L,
+      ApoE == "34" ~ 1L,
+      ApoE == "44" ~ 2L,
+      ApoE == "24" ~ NA_integer_
+    ),
+    APOE4 = factor(APOE4, levels = c(0, 1, 2))
+  )
+
+table(inputdf$ApoE)
+# 22  23  24  33  34  44 
+#  4  53  13 272 100   4 
+```
+
+# Run associations
+Run associations between mitochondrial modules, NDUFs with CR and CDR
+```{r prep files for associations}
+consMEs_br <- read.csv(paste0(brwgcna_dir , "/MEs1_SP12_Br.csv")) # module eigegenes from consensus brain networks generated in 3_br_wgcna.R
+
+# prepare CQN files
+nduf_bb <- read.csv(paste0(nduf_assoc_dir,"/nduf_bb.csv")) # generated in 4_nduf_assoc_de.R; also in supplementary table 12
+br_cqn2use <- readRDS(paste0(indir, "/br_cqn2use.rds")) # a list containing cqn of brain datasets. In each list is a dataframe where rows are genes and columns are donors
+br_cqn_long_ls <- br_cqn2use %>% map(., ~(pivot_longer(.x, cols = c(4:ncol(.x)), names_to="SampleID", values_to="CQN")))
+# filter to focus on only NDUFs, and create into wide format to be used for regression analysis.
+cqn_nduf <- br_cqn_long_ls$DLPFC %>% 
+  filter(gene_id %in% nduf_bb$gene_id) %>% 
+  pivot_wider(names_from = "gene_id", values_from = "CQN") %>% 
+  dplyr::select(SampleID, any_of(nduf_bb$gene_id)) %>% 
+  rename_with(
+    ~ nduf_bb$gene_name[match(.x, nduf_bb$gene_id)],
+    .cols = any_of(nduf_bb$gene_id)
+  )
+# joint the inputdf that contains demographics & sequencing covariates with brain mito module eigengenes and NDUFs expression
+inputdf <- inputdf %>% 
+  left_join(consMEs_br %>% dplyr::select(SubjectID, ME1, ME17, ME26), by = c("SampleID" = "SubjectID")) %>% 
+  left_join(cqn_nduf) %>% 
+  mutate(Batch = factor(Batch, levels=unique(Batch)),
+         Source = factor(Source, levels=unique(Source)))
+```
+
+```{r run analyses}
+MTModsRes <- linear_fn(
+  data_df = inputdf,
+  XVars = with(expand.grid(c("Braak", "Thal", "GlobalPath"), c("_CR", "_CDR")), paste0(Var1, Var2)),
+  YVars = c("ME1", "ME17", "ME26"),
+  base_covs = c("AOD", "Sex_M1F0"),
+  random_var = NULL,
+  mode = "linear"
+)
+MTModsSumm <- MTModsRes %>% 
+  dplyr::select(X, Y, SummDf) %>% 
+  unnest(SummDf) %>% 
+  filter(X == term) %>% 
+  group_by(X) %>% 
+  mutate(q.value = p.adjust(p.value, method = "fdr"), .after = "p.value")
+
+NDUFRes <- linear_fn(
+  data_df = inputdf,
+  XVars = with(expand.grid(c("Braak", "Thal", "GlobalPath"), c("_CR", "_CDR")), paste0(Var1, Var2)),
+  YVars = intersect(nduf_bb$gene_name, names(inputdf)),
+  base_covs = c("AOD", "Sex_M1F0", "RIN", "Source"),
+  random_var = "Batch",
+  mode = "linear mixed"
+)
+NDUFSumm <- NDUFRes %>% 
+  dplyr::select(X, Y, SummDf) %>% 
+  unnest(SummDf) %>% 
+  filter(X == term) %>% 
+  group_by(X) %>% 
+  mutate(q.value = p.adjust(p.value, method = "fdr"), .after = "p.value") %>% 
+  dplyr::select(-effect, -group)
+
+# save the summary dataframe
+write.xlsx(
+  list("MTModules" = MTModsSumm, "NDUFs" = NDUFSumm),
+  paste0(outdir, "/1_1/ROSMAP_CRCDR_Association.xlsx"))
+```
+
+
+# Plot
+These are in first rebuttal Rebuttal Fig.1
+```{r plot}
+plotdf1 <- MTModsSumm %>% 
+  mutate(type = ifelse(grepl("_CR", X), "CR", "CDR"),
+         type = factor(type, levels = c("CR", "CDR")),
+         Y = str_remove(Y, "E"),
+         Y = str_c("Br_", Y),
+         X = str_remove(X, "_.*"),
+         X = factor(X, levels = c("Braak", "Thal", "GlobalPath")),
+         lbl = if_else(q.value<0.05, "\u2731", ""), 
+         lbl = if_else(p.value<0.05 & q.value>0.05,"Δ", lbl))
+
+cairo_pdf(paste0(outdir, "/1_1/MTModsCRCDR_hm.pdf"), width = 4, height = 2.5)
+plotdf1 %>% 
+  filter(type == "CR") %>% 
+  ggplot(aes(x = X, y = Y)) +
+  geom_point(shape=21, color="black", aes(fill=estimate, size = -log(p.value))) +
+  geom_text(aes(label=lbl), size=5/.pt, family = "Arial") +
+  scale_fill_gradient2(low = "blue", high = "red", mid = "white", midpoint = 0, name=expression(beta))+
+  scale_y_discrete(limits = rev) +
+  #scale_size_continuous(range = c(2,10)) + 
+  labs(
+    title = "Association with CR",
+    y = "Brain mitochondrial consensus module",
+    x = "Pathology used to calculate residuals",
+    caption = "Δ:P<0.05\n\u2731:q<0.05") +
+  #facet_grid(.~ type) +
+  theme_minimal(base_size = 6.5) +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1),
+        strip.background = element_rect(colour = "black"),
+        legend.key.size = unit(0.1,"in"),
+        plot.title = element_text(hjust = 0.5)) +
+plotdf1 %>% 
+  filter(type == "CDR") %>% 
+  ggplot(aes(x = X, y = Y)) +
+  geom_point(shape=21, color="black", aes(fill=estimate, size = -log(p.value))) +
+  geom_text(aes(label=lbl), size=5/.pt, family = "Arial") +
+  scale_fill_gradient2(low = "blue", high = "red", mid = "white", midpoint = 0, name=expression(beta))+
+  scale_y_discrete(limits = rev) +
+  #scale_size_continuous(range = c(2,10)) + 
+  labs(
+    title = "Association with CDR",
+    y = "Brain mitochondrial consensus module",
+    x = "Pathology used to calculate residuals",
+    caption = "Δ:P<0.05\n\u2731:q<0.05") +
+  #facet_grid(.~ type) +
+  theme_minimal(base_size = 6.5) +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1),
+        strip.background = element_rect(colour = "black"),
+        legend.key.size = unit(0.1,"in"),
+        plot.title = element_text(hjust = 0.5))
+dev.off() 
+
+plotdf2 <- NDUFSumm %>% 
+  mutate(type = ifelse(grepl("_CR", X), "CR", "CDR"),
+         type = factor(type, levels = c("CR", "CDR")),
+         X = str_remove(X, "_.*"),
+         X = factor(X, levels = c("Braak", "Thal", "GlobalPath")),
+         lbl = if_else(q.value<0.05, "✱", ""), 
+         lbl = if_else(p.value<0.05 & q.value>0.05,"Δ", lbl))
+
+cairo_pdf(paste0(outdir, "/1_1/NDUFsCRCDR_hm.pdf"), width = 4.5, height = 4)
+plotdf2 %>% 
+  filter(type == "CR") %>% 
+  ggplot(aes(x = X, y = Y)) +
+  geom_point(shape=21, color="black", aes(fill=estimate, size = -log(p.value))) +
+  geom_text(aes(label=lbl), size=6/.pt) +
+  scale_fill_gradient2(low = "blue", high = "red", mid = "white", midpoint = 0, name=expression(beta))+
+  #scale_y_discrete(limits = rev) +
+  #scale_size_continuous(range = c(2,10)) + 
+  labs(
+    title = "Association with CR",
+    y = "",
+    x = "Pathology used to calculate residuals",
+    caption = "Δ:P<0.05\n✱:q<0.05") +
+  #facet_grid(.~ type) +
+  guides(size = guide_legend(order = 1)) +
+  theme_minimal(base_size = 7) +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1),
+        axis.text.y = element_text(face = "italic"),
+        strip.background = element_rect(colour = "black"),
+        legend.key.size = unit(0.1,"in"),
+        plot.title = element_text(hjust = 0.5)) +
+plotdf2 %>% 
+  filter(type == "CDR") %>% 
+  ggplot(aes(x = X, y = Y)) +
+  geom_point(shape=21, color="black", aes(fill=estimate, size = -log(p.value))) +
+  geom_text(aes(label=lbl), size=6/.pt) +
+  scale_fill_gradient2(low = "blue", high = "red", mid = "white", midpoint = 0, name=expression(beta))+
+  #scale_y_discrete(limits = rev) +
+  #scale_size_continuous(range = c(2,10)) + 
+  labs(
+    title = "Association with CDR",
+    y = "",
+    x = "Pathology used to calculate residuals",
+    caption = "Δ:P<0.05\n✱:q<0.05") +
+  #facet_grid(.~ type) +
+  guides(size = guide_legend(order = 1)) +
+  theme_minimal(base_size = 7) +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1),
+        axis.text.y = element_text(face = "italic"),
+        strip.background = element_rect(colour = "black"),
+        legend.key.size = unit(0.1,"in"),
+        plot.title = element_text(hjust = 0.5))
+dev.off()
+
+```
 

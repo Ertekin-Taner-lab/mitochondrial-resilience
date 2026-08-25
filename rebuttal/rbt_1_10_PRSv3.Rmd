@@ -1,0 +1,1449 @@
+---
+title: "rbt_1_10_PRS"
+author: "Adelyn"
+date: "2026-2-19"
+output: html_document
+---
+
+If you are using this script, please cite our study. This script addresses comment 10 about genetic risk interaction from reviewer 1. Scripts in `bash` chunk is run in terminal in linux environment.
+
+```{r libraries, include=FALSE}
+suppressPackageStartupMessages(library(tidyverse)) #v2.0.0
+suppressPackageStartupMessages(library(data.table)) #v1.18
+suppressPackageStartupMessages(library(magrittr)) #v2.0.4
+suppressPackageStartupMessages(library(broom)) #v1.0.12
+suppressPackageStartupMessages(library(pbapply)) #v1.7
+suppressPackageStartupMessages(library(openxlsx)) #v4.2.8
+suppressPackageStartupMessages(library(patchwork)) #v1.3.2
+```
+
+# Directories
+
+```{r}
+# input directories
+indir <- "./indir"
+residir <- "./outdir/resids"
+blwgcna_dir <- "./outdir/bl_wgcna"
+nduf_assoc_dir <- "./outdir/nduf_assoc_de"
+
+# output directory
+outdir <- "./Rebuttal/outdir"
+```
+
+# Generate phenotype and covariates files
+
+```{r}
+
+comTrait <- readRDS(paste0(indir, "/comTrait.rds")) # a file having cross-sectional endophenotypes for MCSA (from row 1-105) and ADNI (from row 106-196); row names are donorID
+
+# read in population substructure covariates 
+mcsa_pcs <- read_delim(paste0(indir, "/mcsa_eqtl_covar.txt"), delim = "\t") %>% # a file with WGS IID and population substructure PCs and also ID used in comTrait and other analyses 
+  dplyr::rename(PC1 = EV1, PC2 = EV2, PC3 = EV3) %>% 
+  dplyr::select(IID, ptnum, PC1:PC3) %>% 
+  mutate(ptnum = as.character(ptnum))
+adni_pcs <- read.table(paste0(indir, "/WGS/ADNI_WGS_CSHR_GBHNFL.pca.evec"), skip = 1, header = F, stringsAsFactors = F)
+colnames(adni_pcs)<- c("IID","PC1", "PC2", "PC3", "PC4", "PC5", "PC6", "PC7", "PC8", "PC9", "PC10", "Dx")
+
+
+## prepare MCSA phenotype and covariates files 
+mcsa_phenocov <- comTrait[1:105,] %>% 
+  rownames_to_column("ptnum") %>% 
+  dplyr::select(ptnum, Memory, LMDR, HippVol, Res_X.CL_Y.Mem, Res_X.CL_Y.LMDR, Age, Age_last, Sex, Educ, Hipp_ICV) %>% 
+  dplyr::rename(ResCLMem = Res_X.CL_Y.Mem, ResCLLMDR = Res_X.CL_Y.LMDR) %>% 
+  left_join(mcsa_pcs) %>% 
+  dplyr::select(-ptnum) %>% 
+  mutate(ResCLMem = case_when(ResCLMem == "Resilient" ~ 1L, 
+                              ResCLMem == "Non-resilient" ~ 0L,
+                              TRUE ~ NA_integer_),
+         ResCLLMDR = case_when(ResCLLMDR == "Resilient" ~ 1L, 
+                              ResCLLMDR == "Non-resilient" ~ 0L,
+                              TRUE ~ NA_integer_)) %>% 
+  dplyr::select(IID, everything())
+mcsa_phenocov %>% 
+  dplyr::select(IID, Memory:ResCLLMDR) %>%  # Memory, LMDR, HippVol, Res_X.CL_Y.Mem, Res_X.CL_Y.LMDR
+  write_delim(paste0(outdir, "/1_10/for_PRSice/MCSA_s105_Pheno.txt"), delim = "\t")
+mcsa_phenocov %>% 
+  dplyr::select(IID, Age:PC3) %>% #age, sex, education, PC1-3 
+  write_delim(paste0(outdir, "/1_10/for_PRSice/MCSA_s105_Covar.txt"), delim = "\t")
+
+## prepare ADNI phenotype and covariates files
+adni_phenocovar <- comTrait[106:196,] %>% 
+  rownames_to_column("IID") %>% 
+  dplyr::select(IID, Memory, LMDR, HippVol, Res_X.CL_Y.Mem, Res_X.CL_Y.LMDR, Age, Age_last, Sex, Educ, Hipp_ICV, Mag_HippICV) %>% 
+  dplyr::rename(ResCLMem = Res_X.CL_Y.Mem, ResCLLMDR = Res_X.CL_Y.LMDR) %>%
+  left_join(adni_pcs %>% dplyr::select(IID:PC3) %>% mutate(IID = toupper(IID))) %>% 
+  mutate(ResCLMem = case_when(ResCLMem == "Resilient" ~ 1L, 
+                              ResCLMem == "Non-resilient" ~ 0L,
+                              TRUE ~ NA_integer_),
+         ResCLLMDR = case_when(ResCLLMDR == "Resilient" ~ 1L, 
+                              ResCLLMDR == "Non-resilient" ~ 0L,
+                              TRUE ~ NA_integer_))
+adni_phenocovar %>% 
+  dplyr::select(IID, Memory:ResCLLMDR) %>%  # Memory, LMDR, HippVol, Res_X.CL_Y.Mem, Res_X.CL_Y.LMDR
+  write_delim(paste0(outdir, "/1_10/for_PRSice/ADNI_s91_Pheno.txt"), delim = "\t")
+adni_phenocovar %>% 
+  dplyr::select(IID, Age:PC3) %>% #age, sex, education, PC1-3
+  write_delim(paste0(outdir, "/1_10/for_PRSice/ADNI_s91_Covar.txt"), delim = "\t")
+
+
+```
+
+# Process LD reference panel
+
+Downloaded from PLINK2 resources <https://www.cog-genomics.org/plink/2.0/resources>
+
+```{bash PLINK2}
+# follow the preparation step in: https://dougspeed.com/reference-panel/
+
+cd ./indir/LDRef_PLINK2
+
+awk -F'\t' '$5=="EUR" {print $6}' all_hg38.psam | sort -u #CEU, FIN, GBR, IBS, TSI (https://ftp.1000genomes.ebi.ac.uk/vol1/ftp/README_populations.md)
+awk -F'\t' 'NR==FNR {exclude[$1]=1; next} ($5=="EUR" && $6!="FIN" && !($1 in exclude)) {print $1}' \
+    deg2_hg38.king.cutoff.out.id \
+    all_hg38.psam \
+    > EUR.keep
+echo "." > exclude.snps
+
+plink2 --make-bed \
+  --out EUR.Ref.nors \
+  --pgen all_hg38.pgen \
+  --pvar all_hg38_nors.pvar \
+  --psam all_hg38.psam \
+  --maf 0.01 \
+  --autosome \
+  --snps-only just-acgt \
+  --max-alleles 2 \
+  --rm-dup exclude-all \
+  --exclude exclude.snps \
+  --keep EUR.keep \
+  --memory 8000
+# 8947309 variants
+```
+
+```{r}
+ld_bim <- fread(paste0(indir, "/LDRef_PLINK2/EUR.Ref.nors.bim")) %>%
+  setnames(., colnames(.), c("CHR", "SNP", "CM", "BP", "A1", "A2"))
+
+# sort the two allels based on lexicographic order 
+# we did this so we can have consistent naming of the SNPs across multiple genetic files
+a_low <- pmin(ld_bim$A1, ld_bim$A2)
+a_high <- pmax(ld_bim$A1, ld_bim$A2)
+
+ld_bim$new_id <- paste0(ld_bim$CHR, ":", ld_bim$BP, ":", a_low, ":", a_high)
+write.table(ld_bim[,c("SNP", "new_id")], file = paste0(outdir, "/1_10/for_plink/LDRef_newVarID.txt"), quote = F, row.names = F, col.names = F)
+
+rm(a_low, a_high)
+```
+
+```{bash}
+ld_dir="./indir/LDRef_PLINK2"
+for_plink="./Rebuttal/outdir/1_10/for_plink"
+
+# update the SNP ID so it aligns with base and target data
+plink2 --bfile "${ld_dir}/EUR.Ref.nors" \
+  --update-name "${for_plink}/LDRef_newVarID.txt" 2 1 \
+  --make-bed \
+  --out "${ld_dir}/EUR.Ref.nors.lexicoID"
+```
+
+
+
+# Bellenguez
+
+## QC of Bellenguez harmonized data
+
+Downloaded from <https://ftp.ebi.ac.uk/pub/databases/gwas/summary_statistics/GCST90027001-GCST90028000/GCST90027158/harmonised/>
+
+```{r}
+bellenguez_h <- fread(paste0(indir, "/Bellenguez/harmonized/35379992-GCST90027158-MONDO_0004975.h.tsv.gz"))
+length(unique(bellenguez_h$hm_variant_id)) #20992230, many are NAs because after harmonization they become NAs
+
+
+# select necessary columns and rename columns to make them compatible to target data 
+bell_h <- bellenguez_h %>%
+  drop_na(hm_chrom) %>% 
+  mutate(p_value = as.numeric(p_value)) %>% 
+  mutate(N = n_cas + n_con)
+
+# sort the two allels based on lexicographic order 
+a_low <- pmin(bell_h$hm_other_allele, bell_h$hm_effect_allele)
+a_high <- pmax(bell_h$hm_other_allele, bell_h$hm_effect_allele)
+
+bell_h$new_id <- paste0(bell_h$hm_chrom, ":", bell_h$hm_pos, ":", a_low, ":", a_high)
+bell_h %>% 
+  dplyr::select(hm_chrom, hm_pos, new_id, hm_effect_allele, hm_other_allele, N, standard_error, p_value, hm_odds_ratio) %>% 
+  dplyr::rename(CHR = hm_chrom, BP = hm_pos, SNP = new_id, A1= hm_effect_allele, A2 = hm_other_allele, SE = standard_error, P = p_value, OR = hm_odds_ratio) %>% 
+  fwrite(paste0(indir, "/Bellenguez/harmonized/Bellenguez_h_ColsVarIDUpdated.txt.gz"), sep="\t")
+
+rm(a_low, a_high)
+rm(bellenguez_h, bell_h)
+```
+
+```{bash}
+bellenguez_dir="./indir/Bellenguez/harmonized"
+# remove duplicate SNPs
+gunzip -c "${bellenguez_dir}/Bellenguez_h_ColsVarIDUpdated.txt.gz" |\
+awk '{seen[$3]++; if(seen[$3]==1){ print}}' |\
+gzip - > "${bellenguez_dir}/Bellenguez_h_nodup.gz"
+
+# remove ambiguous SNPs
+gunzip -c "${bellenguez_dir}/Bellenguez_h_nodup.gz" |\
+awk '!( ($4=="A" && $5=="T") || \
+        ($4=="T" && $5=="A") || \
+        ($4=="G" && $5=="C") || \
+        ($4=="C" && $5=="G")) {print}' |\
+    gzip > "${bellenguez_dir}/Bellenguez_h_QC.gz"
+```
+
+```{r}
+# after QC, read in summary statistics from Bellenguez
+bellenguez_qc <- fread(paste0(indir, "/Bellenguez/harmonized/Bellenguez_h_QC.gz"))
+
+bellenguez_qc <- bellenguez_qc  %>%
+    # change the alleles to upper cases
+    .[,c("A1","A2"):=list(toupper(A1), toupper(A2))]
+
+# remove APOE region
+bellenguez_qc_noAPOE <- bellenguez_qc[!(CHR == "19" & BP >= 44000000 & BP <= 46000000)]
+# save QCed Bellenguez files without APOE region
+fwrite(bellenguez_qc_noAPOE, paste0(indir, "/Bellenguez/harmonized/Bellenguez_h_QC_noAPOE.txt.gz"), sep="\t")
+```
+
+
+# Target files QC
+
+Follow this tutorial: <https://choishingwan.github.io/PRS-Tutorial/target/>
+
+The genetic data already underwent QC so we only identify mismatched SNPs b/w target and base files.
+
+## ADNI
+
+### Prepare genotype files
+```{r}
+adni_bim = fread(paste0(indir,"/WGS/ADNI_WGS_CSHRP_GBHNF_UpdatedIIDs_HG38.bim"))  %>% 
+  setnames(., colnames(.), c("CHR", "SNP", "CM", "BP", "A1", "A2"))
+# sort the two allels based on lexicographic order
+a_low <- pmin(adni_bim$A1, adni_bim$A2)
+a_high <- pmax(adni_bim$A1, adni_bim$A2)
+
+adni_bim$new_id <- paste0(adni_bim$CHR, ":", adni_bim$BP, ":", a_low, ":", a_high)
+write.table(adni_bim[,c("SNP", "new_id")], file = paste0(outdir, "/1_10/for_plink/ADNI_WGS_CSHRP_GBHNF_newVarID.txt"), quote = F, row.names = F, col.names = F)
+
+length(intersect(adni_bim$new_id, ld_bim$new_id)) #7969893
+length(intersect(adni_bim$new_id, bell_h$new_id)) #14291555
+
+# check with some example snps to make sure the IDs are aligned
+## this is one of the GWAS significant hit from Bellenguez et al
+bellenguez_qc %>% filter(CHR == 1 & BP == 207577223)
+adni_bim %>% filter(CHR == "1" & BP == 207577223)
+ld_bim %>% filter(CHR == "1" & BP == 207577223)
+
+rm(a_low, a_high)
+rm(adni_bim, ld_bim)
+gc()
+```
+
+
+```{bash}
+wgs_dir="./indir/WGS"
+for_plink="./Rebuttal/outdir/1_10/for_plink"
+plink_outdir="./Rebuttal/outdir/1_10/plink_outs"
+
+# next update variant ID
+plink2 --bfile "${wgs_dir}/ADNI_WGS_CSHRP_GBHNF_UpdatedIIDs_HG38" \
+  --update-name "${for_plink}/ADNI_WGS_CSHRP_GBHNF_newVarID.txt" 2 1 \
+  --make-bed \
+  --allow-extra-chr \
+  --out "${plink_outdir}/ADNI_WGS_CSHRP_GBHNF_UpdatedIIDs_HG38_UpdatedVarID"
+  
+# write snplist
+plink2 --bfile "${plink_outdir}/ADNI_WGS_CSHRP_GBHNF_UpdatedIIDs_HG38_UpdatedVarID" --write-snplist --out "${plink_outdir}/ADNI_WGS_CSHRP_GBHNF_HG38_SNP" --allow-extra-chr
+```
+
+
+### Mismatch SNPs
+
+```{r mismatch SNPs b/w ADNI bim and Bellenguez}
+# read in target bim files, set column names and change the alleles to upper cases
+adni_bim <- fread(paste0(outdir, "/1_10/plink_outs/ADNI_WGS_CSHRP_GBHNF_UpdatedIIDs_HG38_UpdatedVarID.bim")) %>%
+  setnames(., colnames(.), c("CHR", "SNP", "CM", "BP", "B.A1", "B.A2")) %>%
+  .[CHR %in% as.character(seq_len(22))] %>% 
+  .[, CHR := as.integer(CHR)]
+length(intersect(adni_bim$SNP, bellenguez_qc$SNP)) #12252170
+
+# Merge summary statistic with target
+info <- merge(adni_bim, bellenguez_qc, by=c("SNP", "CHR", "BP")) #12252170 SNPs
+
+# Function for calculating the complementary allele
+complement <- function(x){
+    switch (x,
+        "A" = "T",
+        "C" = "G",
+        "T" = "A",
+        "G" = "C",
+        return(NA)
+    )
+} 
+# Get SNPs that have the same A1/A2 alleles across base and target
+info.match <- info[A1 == B.A1 & A2 == B.A2, SNP] # 10931817 SNPs
+# Identify SNPs that are complementary between base and target
+com.snps <- info[sapply(B.A1, complement) == A1 &
+                    sapply(B.A2, complement) == A2, SNP] # empty
+
+# identify SNPs that need recoding
+recode.snps <- info[B.A1==A2 & B.A2==A1, SNP] #1320353
+# Update the bim file
+adni_bim <- adni_bim[SNP %in% recode.snps, c("B.A1", "B.A2") := list(B.A2, B.A1)]
+
+# identify SNPs that need recoding & complement
+com.recode <- info[sapply(B.A1, complement) == A2 &
+                    sapply(B.A2, complement) == A1, SNP] #empty
+
+# Write the updated bim file
+fwrite(adni_bim[,c("SNP", "B.A2")], paste0(outdir, "/1_10/for_plink/ADNI_WGS_CSHRP_GBHNF_HG38.a2"), col.names=F, sep="\t")
+
+# identify SNPs with different allele in base and target 
+mismatch <- adni_bim[!(SNP %in% info.match |
+                    SNP %in% com.snps |
+                    SNP %in% recode.snps |
+                    SNP %in% com.recode), SNP] #8114274
+write.table(mismatch, paste0(outdir, "/1_10/for_plink/ADNI_WGS_CSHRP_GBHNF_HG38.mismatch"), quote=F, row.names=F, col.names=F)
+
+rm(adni_bim, info, info.match, com.snps, recode.snps, com.recode, mismatch)
+```
+
+```{r mismatch SNPs b/w ADNI bim and Bellenguez no APOE region}
+# read in target bim files, set column names and change the alleles to upper cases
+adni_bim <- fread(paste0(outdir, "/1_10/plink_outs/ADNI_WGS_CSHRP_GBHNF_UpdatedIIDs_HG38_UpdatedVarID.bim")) %>%
+  setnames(., colnames(.), c("CHR", "SNP", "CM", "BP", "B.A1", "B.A2")) %>%
+  .[CHR %in% as.character(seq_len(22))] %>% 
+  .[, CHR := as.integer(CHR)]
+length(unique(adni_bim$SNP)) # 20366438, there are 6 duplicates 
+length(intersect(adni_bim$SNP, bellenguez_qc_noAPOE$SNP)) #12243734
+length(unique(intersect(adni_bim$SNP, bellenguez_qc_noAPOE$SNP))) #12243734; no duplicated SNPs are in Bellenguez
+
+# Merge summary statistic with target
+info <- merge(adni_bim, bellenguez_qc_noAPOE, by=c("SNP", "CHR", "BP")) #12243734 SNPs
+
+# Function for calculating the complementary allele
+complement <- function(x){
+    switch (x,
+        "A" = "T",
+        "C" = "G",
+        "T" = "A",
+        "G" = "C",
+        return(NA)
+    )
+} 
+# Get SNPs that have the same A1/A2 alleles across base and target
+info.match <- info[A1 == B.A1 & A2 == B.A2, SNP] # 10924212 SNPs
+# Identify SNPs that are complementary between base and target
+com.snps <- info[sapply(B.A1, complement) == A1 &
+                    sapply(B.A2, complement) == A2, SNP] # empty
+
+# identify SNPs that need recoding
+recode.snps <- info[B.A1==A2 & B.A2==A1, SNP] #1319522
+# Update the bim file
+adni_bim <- adni_bim[SNP %in% recode.snps, c("B.A1", "B.A2") := list(B.A2, B.A1)]
+
+# identify SNPs that need recoding & complement
+com.recode <- info[sapply(B.A1, complement) == A2 &
+                    sapply(B.A2, complement) == A1, SNP] #empty
+
+# Write the updated bim file
+fwrite(adni_bim[,c("SNP", "B.A2")], paste0(outdir, "/1_10/for_plink/ADNI_WGS_CSHRP_GBHNF_HG38_noAPOE.a2"), col.names=F, sep="\t")
+
+# identify SNPs with different allele in base and target 
+mismatch <- adni_bim[!(SNP %in% info.match |
+                    SNP %in% com.snps |
+                    SNP %in% recode.snps |
+                    SNP %in% com.recode), SNP] # 8122710
+write.table(mismatch, paste0(outdir, "/1_10/for_plink/ADNI_WGS_CSHRP_GBHNF_HG38_noAPOE.mismatch"), quote=F, row.names=F, col.names=F)
+
+rm(adni_bim, info, info.match, com.snps, recode.snps, com.recode, mismatch)
+```
+
+### Final QCed target files
+```{bash}
+plink2 \
+  --bfile "${plink_outdir}/ADNI_WGS_CSHRP_GBHNF_UpdatedIIDs_HG38_UpdatedVarID" \
+  --make-bed --out "${plink_outdir}/ADNI_WGS_FinalQCed" \
+  --rm-dup exclude-all \
+  --allow-extra-chr \
+  --exclude "${for_plink}/ADNI_WGS_CSHRP_GBHNF_HG38.mismatch" \
+  --ref-allele "${for_plink}/ADNI_WGS_CSHRP_GBHNF_HG38.a2" 
+  #alt-allele isn't available in plink2; rm-dup isn't available in plink1.9
+# check how many overlap snps there're between ADNI WGS QCed file and LD reference panel
+awk 'NR==FNR{a[$2]=1; next} $2 in a' ADNI_WGS_FinalQCed.bim ./indir/LDRef_PLINK2/EUR.Ref.nors.lexicoID.bim | wc -l #6508710
+
+  
+plink2 \
+  --bfile "${plink_outdir}/ADNI_WGS_CSHRP_GBHNF_UpdatedIIDs_HG38_UpdatedVarID" \
+  --make-bed --out "${plink_outdir}/ADNI_WGS_noAPOE_FinalQCed" \
+  --rm-dup exclude-all \
+  --allow-extra-chr \
+  --exclude "${for_plink}/ADNI_WGS_CSHRP_GBHNF_HG38_noAPOE.mismatch" \
+  --ref-allele "${for_plink}/ADNI_WGS_CSHRP_GBHNF_HG38.a2" 
+# check how many overlapping variants between MCSA WGS and LD reference panel
+awk 'NR==FNR{a[$2]=1; next} $2 in a' ADNI_WGS_noAPOE_FinalQCed.bim ./indir/LDRef_PLINK2/EUR.Ref.nors.lexicoID.bim | wc -l #6508710
+```
+
+
+## MCSA 
+### Prepare genotype files
+Logic of preparation is the same as ADNI's
+```{r}
+mcsa_bim = fread(paste0(indir,"/WGS/R01_Resilience_WGS_CSHRP_VNGBHF.bim"))  %>% 
+  setnames(., colnames(.), c("CHR", "SNP", "CM", "BP", "A1", "A2"))
+# sort the two allels based on lexicographic order
+a_low <- pmin(mcsa_bim$A1, mcsa_bim$A2)
+a_high <- pmax(mcsa_bim$A1, mcsa_bim$A2)
+
+mcsa_bim$new_id <- paste0(mcsa_bim$CHR, ":", mcsa_bim$BP, ":", a_low, ":", a_high)
+write.table(mcsa_bim[,c("SNP", "new_id")], file = paste0(outdir, "/1_10/for_plink/R01MCSA_WGS_CSHRP_GBHNF_newVarID.txt"), quote = F, row.names = F, col.names = F)
+
+length(intersect(mcsa_bim$new_id, bellenguez_qc$SNP)) #6172272
+
+# check with some example snps to make sure the IDs are aligned
+## this is one of the GWAS significant hit from Bellenguez et al
+bellenguez_qc %>% filter(CHR == 1 & BP == 207577223)
+mcsa_bim %>% filter(CHR == "1" & BP == 207577223)
+
+rm(a_low, a_high, mcsa_bim)
+gc()
+```
+
+
+```{bash}
+# extract only autosomal chromosomes
+
+plink2 --bfile "${wgs_dir}/R01_Resilience_WGS_CSHRP_VNGBHF" \
+  --autosome \
+  --update-name "${for_plink}/R01MCSA_WGS_CSHRP_GBHNF_newVarID.txt" 2 1 \
+  --make-bed \
+  --out "${plink_outdir}/MCSA_WGS_CHR1_22_UpdatedVarID"
+  
+# write snplist
+plink2 --bfile "${plink_outdir}/MCSA_WGS_CHR1_22_UpdatedVarID" --write-snplist --out "${plink_outdir}/MCSA_SNP"
+```
+
+
+### Mismatch SNPs
+
+```{r mismatch SNPs b/w MCSA bim and bellenguez}
+# read in target bim files, set column names and change the alleles to upper cases
+mcsa.bim <- fread(paste0(outdir, "/1_10/plink_outs/MCSA_WGS_CHR1_22_UpdatedVarID.bim")) %>%
+    setnames(., colnames(.), c("CHR", "SNP", "CM", "BP", "B.A1", "B.A2")) %>%
+    .[,c("B.A1","B.A2"):=list(toupper(B.A1), toupper(B.A2))]
+length(unique(mcsa.bim$SNP)) #8333349, all are unique
+
+# Merge summary statistic with target
+info <- merge(mcsa.bim, bellenguez_qc, by=c("SNP", "CHR", "BP"))  #6172272 SNPs
+
+# Function for calculating the complementary allele
+complement <- function(x){
+    switch (x,
+        "A" = "T",
+        "C" = "G",
+        "T" = "A",
+        "G" = "C",
+        return(NA)
+    )
+} 
+# Get SNPs that have the same alleles across base and target
+info.match <- info[A1 == B.A1 & A2 == B.A2, SNP] # 4867381 SNPs
+# Identify SNPs that are complementary between base and target
+com.snps <- info[sapply(B.A1, complement) == A1 &
+                    sapply(B.A2, complement) == A2, SNP] # empty
+
+# identify SNPs that need recoding
+recode.snps <- info[B.A1==A2 & B.A2==A1, SNP] #1304891 SNPs
+# Update the bim file
+mcsa.bim <- mcsa.bim[SNP %in% recode.snps, c("B.A1", "B.A2") := list(B.A2, B.A1)]
+
+# identify SNPs that need recoding & complement
+com.recode <- info[sapply(B.A1, complement) == A2 &
+                    sapply(B.A2, complement) == A1, SNP] #empty
+
+# Write the updated bim file
+fwrite(mcsa.bim[,c("SNP", "B.A2")], paste0(outdir, "/1_10/for_plink/MCSA.a2"), col.names=F, sep="\t")
+
+# identify SNPs with different allele in base and target 
+mismatch <- mcsa.bim[!(SNP %in% info.match |
+                    SNP %in% com.snps |
+                    SNP %in% recode.snps |
+                    SNP %in% com.recode), SNP]
+write.table(mismatch, paste0(outdir, "/1_10/for_plink/MCSA.mismatch"), quote=F, row.names=F, col.names=F) #2161077 SNPs
+
+rm(mcsa.bim, info, info.match, com.snps, recode.snps, com.recode, mismatch)
+```
+
+```{r mismatch SNPs b/w MCSA bim and bellenguez no APOE region}
+# read in target bim files, set column names and change the alleles to upper cases
+mcsa.bim <- fread(paste0(outdir, "/1_10/plink_outs/MCSA_WGS_CHR1_22_UpdatedVarID.bim")) %>%
+    setnames(., colnames(.), c("CHR", "SNP", "CM", "BP", "B.A1", "B.A2")) %>%
+    .[,c("B.A1","B.A2"):=list(toupper(B.A1), toupper(B.A2))]
+length(unique(mcsa.bim$SNP)) #8333349, all are unique
+
+# Merge summary statistic with target
+info <- merge(mcsa.bim, bellenguez_qc_noAPOE, by=c("SNP", "CHR", "BP"))  #6168090 SNPs
+
+# Function for calculating the complementary allele
+complement <- function(x){
+    switch (x,
+        "A" = "T",
+        "C" = "G",
+        "T" = "A",
+        "G" = "C",
+        return(NA)
+    )
+} 
+# Get SNPs that have the same alleles across base and target
+info.match <- info[A1 == B.A1 & A2 == B.A2, SNP] # 4863997 SNPs
+# Identify SNPs that are complementary between base and target
+com.snps <- info[sapply(B.A1, complement) == A1 &
+                    sapply(B.A2, complement) == A2, SNP] # empty
+
+# identify SNPs that need recoding
+recode.snps <- info[B.A1==A2 & B.A2==A1, SNP] #1304093 SNPs
+# Update the bim file
+mcsa.bim <- mcsa.bim[SNP %in% recode.snps, c("B.A1", "B.A2") := list(B.A2, B.A1)]
+
+# identify SNPs that need recoding & complement
+com.recode <- info[sapply(B.A1, complement) == A2 &
+                    sapply(B.A2, complement) == A1, SNP] #empty
+
+# Write the updated bim file
+fwrite(mcsa.bim[,c("SNP", "B.A2")], paste0(outdir, "/1_10/for_plink/MCSA_noAPOE.a2"), col.names=F, sep="\t")
+
+# identify SNPs with different allele in base and target 
+mismatch <- mcsa.bim[!(SNP %in% info.match |
+                    SNP %in% com.snps |
+                    SNP %in% recode.snps |
+                    SNP %in% com.recode), SNP]
+write.table(mismatch, paste0(outdir, "/1_10/for_plink/MCSA_noAPOE.mismatch"), quote=F, row.names=F, col.names=F) #2165259 SNPs
+
+rm(mcsa.bim, info, info.match, com.snps, recode.snps, com.recode, mismatch)
+```
+
+### Final QCed target files
+```{bash}
+plink2 \
+  --bfile "${plink_outdir}/MCSA_WGS_CHR1_22_UpdatedVarID" \
+  --make-bed --out "${plink_outdir}/MCSA_WGS_FinalQCed" \
+  --rm-dup exclude-all \
+  --exclude "${for_plink}/MCSA.mismatch" \
+  --ref-allele "${for_plink}/MCSA.a2" 
+  #alt-allele isn't available in plink2; rm-dup isn't available in plink1.9
+# check how many overlapping variants between MCSA WGS and LD reference panel
+awk 'NR==FNR{a[$2]=1; next} $2 in a' MCSA_WGS_FinalQCed.bim ./indir/LDRef_PLINK2/EUR.Ref.nors.lexicoID.bim | wc -l #5748621 
+
+  
+plink2 \
+  --bfile "${plink_outdir}/MCSA_WGS_CHR1_22_UpdatedVarID" \
+  --make-bed --out "${plink_outdir}/MCSA_WGS_noAPOE_FinalQCed" \
+  --rm-dup exclude-all \
+  --allow-extra-chr \
+  --exclude "${for_plink}/MCSA_noAPOE.mismatch" \
+  --ref-allele "${for_plink}/MCSA_noAPOE.a2" 
+# check how many overlapping variants between MCSA WGS and LD reference panel
+awk 'NR==FNR{a[$2]=1; next} $2 in a' MCSA_WGS_noAPOE_FinalQCed.bim ./indir/LDRef_PLINK2/EUR.Ref.nors.lexicoID.bim | wc -l #5744763
+```
+
+# Run PRsice
+
+
+```{bash directories}
+bellenguez_dir="./indir/Bellenguez/harmonized"
+plink_outdir="./Rebuttal/outdir/1_10/plink_outs"
+for_PRSice="./Rebuttal/outdir/1_10/for_PRSice"
+PRSice_out="./Rebuttal/outdir/1_10/PRSice_outs_v3"
+ldref_plink2_dir="./indir/LDRef_PLINK2"
+```
+
+## ADNI 
+```{bash ADNI-PRS}
+Rscript /Functions/PRSice/PRSice.R \
+    --prsice /Functions/PRSice/PRSice_linux \
+    --base "${bellenguez_dir}/Bellenguez_h_QC.gz" \
+    --target "${plink_outdir}/ADNI_WGS_FinalQCed" \
+    --binary-target F,F \
+    --ignore-fid \
+    --pheno "${for_PRSice}/ADNI_s91_Pheno.txt" \
+    --pheno-col Memory,LMDR \
+    --cov "${for_PRSice}/ADNI_s91_Covar.txt" \
+    --cov-col Age,Sex,Educ,PC1,PC2,PC3 \
+    --cov-factor Sex \
+    --quantile 10 \
+    --clump-r2 0.1 \
+    --ld "${ldref_plink2_dir}/EUR.Ref.nors.lexicoID" \
+    --device pdf \
+    --perm 10000 \
+    --stat OR \
+    --or \
+    --seed 123 \
+    --out "${PRSice_out}/ADNI/ADNI_Cog" #permuted p-value insignificant
+    
+Rscript /Functions/PRSice/PRSice.R \
+    --prsice /Functions/PRSice/PRSice_linux \
+    --base "${bellenguez_dir}/Bellenguez_h_QC.gz" \
+    --target "${plink_outdir}/ADNI_WGS_FinalQCed" \
+    --binary-target F \
+    --ignore-fid \
+    --pheno "${for_PRSice}/ADNI_s91_Pheno.txt" \
+    --pheno-col HippVol \
+    --cov "${for_PRSice}/ADNI_s91_Covar.txt" \
+    --cov-col Age,Sex,Educ,Hipp_ICV,Mag_HippICV,PC1,PC2,PC3 \
+    --cov-factor Sex,Mag_HippICV \
+    --quantile 10 \
+    --clump-r2 0.1 \
+    --ld "${ldref_plink2_dir}/EUR.Ref.nors.lexicoID" \
+    --device pdf \
+    --perm 10000 \
+    --stat OR \
+    --or \
+    --seed 123 \
+    --out "${PRSice_out}/ADNI/ADNI_HV"
+```
+
+
+```{bash ADNI-PRS no APOE}
+Rscript /Functions/PRSice/PRSice.R \
+    --prsice /Functions/PRSice/PRSice_linux \
+    --base "${bellenguez_dir}/Bellenguez_h_QC_noAPOE.txt.gz" \
+    --target "${plink_outdir}/ADNI_WGS_noAPOE_FinalQCed" \
+    --binary-target F,F \
+    --ignore-fid \
+    --pheno "${for_PRSice}/ADNI_s91_Pheno.txt" \
+    --pheno-col Memory,LMDR \
+    --cov "${for_PRSice}/ADNI_s91_Covar.txt" \
+    --cov-col Age,Sex,Educ,PC1,PC2,PC3 \
+    --cov-factor Sex \
+    --quantile 10 \
+    --clump-r2 0.1 \
+    --ld "${ldref_plink2_dir}/EUR.Ref.nors.lexicoID" \
+    --device pdf \
+    --perm 10000 \
+    --stat OR \
+    --or \
+    --seed 123 \
+    --out "${PRSice_out}/ADNI_noAPOE/ADNI_noAPOE_Cog"
+    
+Rscript /Functions/PRSice/PRSice.R \
+    --prsice /Functions/PRSice/PRSice_linux \
+    --base "${bellenguez_dir}/Bellenguez_h_QC_noAPOE.txt.gz" \
+    --target "${plink_outdir}/ADNI_WGS_noAPOE_FinalQCed" \
+    --binary-target F \
+    --ignore-fid \
+    --pheno "${for_PRSice}/ADNI_s91_Pheno.txt" \
+    --pheno-col HippVol \
+    --cov "${for_PRSice}/ADNI_s91_Covar.txt" \
+    --cov-col Age,Sex,Educ,Hipp_ICV,Mag_HippICV,PC1,PC2,PC3 \
+    --cov-factor Sex,Mag_HippICV \
+    --quantile 10 \
+    --clump-r2 0.1 \
+    --ld "${ldref_plink2_dir}/EUR.Ref.nors.lexicoID" \
+    --device pdf \
+    --perm 10000 \
+    --stat OR \
+    --or \
+    --seed 123 \
+    --out "${PRSice_out}/ADNI_noAPOE/ADNI_noAPOE_HV"
+```
+
+
+## MCSA
+```{bash MCSA-PRS}
+Rscript /Functions/PRSice/PRSice.R \
+    --prsice /Functions/PRSice/PRSice_linux \
+    --base "${bellenguez_dir}/Bellenguez_h_QC.gz" \
+    --target "${plink_outdir}/MCSA_WGS_FinalQCed" \
+    --binary-target F,F \
+    --ignore-fid \
+    --pheno "${for_PRSice}/MCSA_s105_Pheno.txt" \
+    --pheno-col Memory,LMDR \
+    --cov "${for_PRSice}/MCSA_s105_Covar.txt" \
+    --cov-col Age,Sex,Educ,PC1,PC2,PC3 \
+    --cov-factor Sex \
+    --quantile 10 \
+    --clump-r2 0.1 \
+    --ld "${ldref_plink2_dir}/EUR.Ref.nors.lexicoID" \
+    --device pdf \
+    --perm 10000 \
+    --stat OR \
+    --or \
+    --seed 123 \
+    --out "${PRSice_out}/MCSA/MCSA_Cog"
+    
+Rscript /Functions/PRSice/PRSice.R \
+    --prsice /Functions/PRSice/PRSice_linux \
+    --base "${bellenguez_dir}/Bellenguez_h_QC.gz" \
+    --target "${plink_outdir}/MCSA_WGS_FinalQCed" \
+    --binary-target F \
+    --ignore-fid \
+    --pheno "${for_PRSice}/MCSA_s105_Pheno.txt" \
+    --pheno-col HippVol \
+    --cov "${for_PRSice}/MCSA_s105_Covar.txt" \
+    --cov-col Age,Sex,Educ,Hipp_ICV,PC1,PC2,PC3 \
+    --cov-factor Sex \
+    --quantile 10 \
+    --clump-r2 0.1 \
+    --ld "${ldref_plink2_dir}/EUR.Ref.nors.lexicoID" \
+    --device pdf \
+    --perm 10000 \
+    --stat OR \
+    --or \
+    --seed 123 \
+    --out "${PRSice_out}/MCSA/MCSA_HV"
+```
+
+
+```{bash MCSA-no APOE}
+Rscript /Functions/PRSice/PRSice.R \
+    --prsice /Functions/PRSice/PRSice_linux \
+    --base "${bellenguez_dir}/Bellenguez_h_QC_noAPOE.txt.gz" \
+    --target "${plink_outdir}/MCSA_WGS_noAPOE_FinalQCed" \
+    --binary-target F,F \
+    --ignore-fid \
+    --pheno "${for_PRSice}/MCSA_s105_Pheno.txt" \
+    --pheno-col Memory,LMDR \
+    --cov "${for_PRSice}/MCSA_s105_Covar.txt" \
+    --cov-col Age,Sex,Educ,PC1,PC2,PC3 \
+    --cov-factor Sex \
+    --quantile 10 \
+    --clump-r2 0.1 \
+    --ld "${ldref_plink2_dir}/EUR.Ref.nors.lexicoID" \
+    --device pdf \
+    --perm 10000 \
+    --stat OR \
+    --or \
+    --seed 123 \
+    --out "${PRSice_out}/MCSA_noAPOE/MCSA_noAPOE_Cog"
+
+Rscript /Functions/PRSice/PRSice.R \
+    --prsice /Functions/PRSice/PRSice_linux \
+    --base "${bellenguez_dir}/Bellenguez_h_QC_noAPOE.txt.gz" \
+    --target "${plink_outdir}/MCSA_WGS_noAPOE_FinalQCed" \
+    --binary-target F \
+    --ignore-fid \
+    --pheno "${for_PRSice}/MCSA_s105_Pheno.txt" \
+    --pheno-col HippVol \
+    --cov "${for_PRSice}/MCSA_s105_Covar.txt" \
+    --cov-col Age,Sex,Educ,Hipp_ICV,PC1,PC2,PC3 \
+    --cov-factor Sex \
+    --quantile 10 \
+    --clump-r2 0.1 \
+    --ld "${ldref_plink2_dir}/EUR.Ref.nors.lexicoID" \
+    --device pdf \
+    --perm 10000 \
+    --stat OR \
+    --or \
+    --seed 123 \
+    --out "${PRSice_out}/MCSA_noAPOE/MCSA_noAPOE_HV"
+```
+
+
+# Interaction analysis
+## Organize PRS results
+This part is to combine all the best PRS for downstream analysis
+```{r adni-prs}
+adni_mem <- read_delim(paste0(outdir, "/1_10/PRSice_outs_v3/ADNI/ADNI_Cog.Memory.best"))
+adni_lmdr <- read_delim(paste0(outdir, "/1_10/PRSice_outs_v3/ADNI/ADNI_Cog.LMDR.best"))
+adni_hv <- read_delim(paste0(outdir, "/1_10/PRSice_outs_v3/ADNI/ADNI_HV.best"))
+
+adni_prs <- adni_mem %>% 
+  filter(In_Regression == "Yes") %>% 
+  dplyr::select(IID, PRS) %>% 
+  dplyr::rename(Mem_PRS = PRS) %>% 
+  left_join(
+    adni_lmdr %>% 
+      filter(In_Regression == "Yes") %>% 
+      dplyr::select(IID, PRS) %>% 
+      dplyr::rename(LMDR_PRS = PRS)
+  ) %>% 
+  left_join(
+    adni_hv %>% 
+      filter(In_Regression == "Yes") %>% 
+      dplyr::select(IID, PRS) %>% 
+      dplyr::rename(HV_PRS = PRS)
+  ) %>% 
+  left_join(
+    comTrait %>% 
+      rownames_to_column("IID") %>% 
+      dplyr::select(IID, Age, Sex, Educ, Memory, LMDR, HippVol, Hipp_ICV, Mag_HippICV, LastDx_binary)
+  ) %>% 
+  left_join(adni_pcs %>% dplyr::select(IID:PC3) %>% mutate(IID = toupper(IID)))
+write_delim(adni_prs, file = paste0(outdir, "/1_10/adni_prs_v3.txt"), delim = "\t")
+rm(adni_mem, adni_lmdr, adni_hv)
+```
+
+```{r mcsa-prs}
+
+mcsa_mem <- read_delim(paste0(outdir, "/1_10/PRSice_outs_v3/MCSA/MCSA_Cog.Memory.best"))
+mcsa_lmdr <- read_delim(paste0(outdir, "/1_10/PRSice_outs_v3/MCSA/MCSA_Cog.LMDR.best"))
+mcsa_hv <- read_delim(paste0(outdir, "/1_10/PRSice_outs_v3/MCSA/MCSA_HV.best"))
+
+mcsa_prs <- mcsa_mem %>% 
+  dplyr::select(IID, PRS) %>% 
+  dplyr::rename(Mem_PRS = PRS) %>% 
+  left_join(
+    mcsa_lmdr %>% 
+      dplyr::select(IID, PRS) %>% 
+      dplyr::rename(LMDR_PRS = PRS)
+  ) %>% 
+  left_join(
+    mcsa_hv %>% 
+      dplyr::select(IID, PRS) %>% 
+      dplyr::rename(HV_PRS = PRS)
+  ) %>% 
+  left_join(
+    comTrait %>% 
+      rownames_to_column("SubjectID") %>% 
+      dplyr::select(SubjectID, Age, Sex, Educ, Memory, LMDR, HippVol, Hipp_ICV, Mag_HippICV, LastDx_binary) %>% 
+      left_join(mcsa_pcs %>% dplyr::select(IID, ptnum) %>% dplyr::rename(SubjectID = ptnum))
+  ) %>% 
+  inner_join(
+    mcsa_pcs %>% dplyr::rename(SubjectID = ptnum)
+  ) %>% 
+  dplyr::select(IID, SubjectID, everything()) #IID (the genetic ID) is different from SubjectID. SubjectID is present in all other analysis results, so need to keep this column for downstream anaylsis.
+write_delim(mcsa_prs, file = paste0(outdir, "/1_10/mcsa_prs_v3.txt"), delim = "\t")
+rm(mcsa_mem, mcsa_lmdr, mcsa_hv)
+```
+
+We also computed PRS excluding APOE region
+```{r adni-prs-noAPOE}
+adni_mem <- read_delim(paste0(outdir, "/1_10/PRSice_outs_v3/ADNI_noAPOE/ADNI_noAPOE_Cog.Memory.best"))
+adni_lmdr <- read_delim(paste0(outdir, "/1_10/PRSice_outs_v3/ADNI_noAPOE/ADNI_noAPOE_Cog.LMDR.best"))
+adni_hv <- read_delim(paste0(outdir, "/1_10/PRSice_outs_v3/ADNI_noAPOE/ADNI_noAPOE_HV.best"))
+
+
+adni_prs_noAPOE <- adni_mem %>% 
+  dplyr::select(IID, PRS) %>% 
+  dplyr::rename(Mem_PRS = PRS) %>% 
+  left_join(
+    adni_lmdr %>% 
+      dplyr::select(IID, PRS) %>% 
+      dplyr::rename(LMDR_PRS = PRS)
+  ) %>% 
+  left_join(
+    adni_hv %>% 
+      dplyr::select(IID, PRS) %>% 
+      dplyr::rename(HV_PRS = PRS)
+  ) %>% 
+  left_join(
+    comTrait %>% 
+      rownames_to_column("IID") %>% 
+      dplyr::select(IID, Age, Sex, Educ, Memory, LMDR, HippVol, Hipp_ICV, Mag_HippICV, LastDx_binary)
+  ) %>% 
+  left_join(adni_pcs %>% dplyr::select(IID:PC3) %>% mutate(IID= toupper(IID)))
+rm(adni_mem, adni_lmdr, adni_hv)
+write_delim(adni_prs_noAPOE, file = paste0(outdir, "/1_10/adni_prs_noAPOE_v3.txt"), delim = "\t")
+```
+
+```{r mcsa-prs-no APOE}
+
+mcsa_mem <- read_delim(paste0(outdir, "/1_10/PRSice_outs_v3/MCSA_noAPOE/MCSA_noAPOE_Cog.Memory.best"))
+mcsa_lmdr <- read_delim(paste0(outdir, "/1_10/PRSice_outs_v3/MCSA_noAPOE/MCSA_noAPOE_Cog.LMDR.best"))
+mcsa_hv <- read_delim(paste0(outdir, "/1_10/PRSice_outs_v3/MCSA_noAPOE/MCSA_noAPOE_HV.best"))
+
+mcsa_prs_noAPOE <- mcsa_mem %>% 
+  dplyr::select(IID, PRS) %>% 
+  dplyr::rename(Mem_PRS = PRS) %>% 
+  left_join(
+    mcsa_lmdr %>% 
+      dplyr::select(IID, PRS) %>% 
+      dplyr::rename(LMDR_PRS = PRS)
+  ) %>% 
+  left_join(
+    mcsa_hv %>% 
+      dplyr::select(IID, PRS) %>% 
+      dplyr::rename(HV_PRS = PRS)
+  ) %>% 
+  left_join(
+    comTrait %>% 
+      rownames_to_column("SubjectID") %>% 
+      dplyr::select(SubjectID, Age, Sex, Educ, Memory, LMDR, HippVol, Hipp_ICV, Mag_HippICV, LastDx_binary) %>% 
+      left_join(mcsa_pcs %>% dplyr::select(IID, ptnum) %>% dplyr::rename(SubjectID = ptnum))
+  ) %>% 
+  inner_join(
+    mcsa_pcs %>% dplyr::rename(SubjectID = ptnum)
+  ) %>%
+  dplyr::select(IID, SubjectID, everything()) #IID (the genetic ID) is different from SubjectID. SubjectID is present in all other analysis results, so need to keep this column for downstream anaylsis.
+rm(mcsa_mem, mcsa_lmdr, mcsa_hv)
+
+write_delim(mcsa_prs_noAPOE, file = paste0(outdir, "/1_10/mcsa_prs_noAPOE_v3.txt"), delim = "\t")
+```
+
+```{r boxplot of PRS}
+# calculate if there's significant difference in PRS by last diagnosis
+mcsa_prs %>% 
+  mutate(across(ends_with("PRS"), ~as.numeric(scale(.)))) %>% 
+  pivot_longer(cols = ends_with("_PRS"), names_to = "PRS_type", values_to = "PRS") %>% 
+  mutate(PRS_type = str_remove(PRS_type, "_PRS")) %>% 
+  filter(!is.na(LastDx_binary)) %>%
+  group_by(PRS_type) %>%
+  summarise(
+    p = {
+      wilcox.test(PRS ~ LastDx_binary)$p.value
+    }, .groups = "drop"
+  )
+adni_prs %>% 
+  mutate(across(ends_with("PRS"), ~as.numeric(scale(.)))) %>% 
+  pivot_longer(cols = ends_with("_PRS"), names_to = "PRS_type", values_to = "PRS") %>% 
+  mutate(PRS_type = str_remove(PRS_type, "_PRS")) %>% 
+  filter(!is.na(LastDx_binary)) %>%
+  group_by(PRS_type) %>%
+  summarise(
+    p = {
+      wilcox.test(PRS ~ LastDx_binary)$p.value
+    }, .groups = "drop"
+  )
+
+mcsa_prs_noAPOE %>% 
+  mutate(across(ends_with("PRS"), ~as.numeric(scale(.)))) %>% 
+  pivot_longer(cols = ends_with("_PRS"), names_to = "PRS_type", values_to = "PRS") %>% 
+  mutate(PRS_type = str_remove(PRS_type, "_PRS")) %>% 
+  filter(!is.na(LastDx_binary)) %>%
+  group_by(PRS_type) %>%
+  summarise(
+    p = {
+      wilcox.test(PRS ~ LastDx_binary)$p.value
+    }, .groups = "drop"
+  )
+adni_prs_noAPOE %>% 
+  mutate(across(ends_with("PRS"), ~as.numeric(scale(.)))) %>% 
+  pivot_longer(cols = ends_with("_PRS"), names_to = "PRS_type", values_to = "PRS") %>% 
+  mutate(PRS_type = str_remove(PRS_type, "_PRS")) %>% 
+  filter(!is.na(LastDx_binary)) %>%
+  group_by(PRS_type) %>%
+  summarise(
+    p = {
+      wilcox.test(PRS ~ LastDx_binary)$p.value
+    }, .groups = "drop"
+  )
+
+# below plot the boxplots of scaled PRS by last diagnosis
+p1 <- mcsa_prs %>% 
+  mutate(across(ends_with("PRS"), ~as.numeric(scale(.)))) %>% 
+  pivot_longer(Mem_PRS:HV_PRS, names_to = "Phenotype", values_to = "PRS") %>% 
+  mutate(Phenotype = str_remove(Phenotype, "_PRS"),
+         Phenotype = factor(Phenotype, levels = c("Mem", "LMDR", "HV"))) %>% 
+  drop_na(LastDx_binary) %>% 
+  ggplot(aes(x = Phenotype, y = PRS, color = LastDx_binary)) +
+  geom_boxplot() +
+  labs(title = "MCSA", y= "Scaled PRS", color = "LastDx") + 
+  theme_classic() +
+  theme(text = element_text(family = "ArialMT"))
+p2 <- adni_prs %>% 
+  mutate(across(ends_with("PRS"), ~as.numeric(scale(.)))) %>% 
+  pivot_longer(Mem_PRS:HV_PRS, names_to = "Phenotype", values_to = "PRS") %>% 
+  mutate(Phenotype = str_remove(Phenotype, "_PRS"),
+         Phenotype = factor(Phenotype, levels = c("Mem", "LMDR", "HV"))) %>% 
+  drop_na(LastDx_binary) %>% 
+  ggplot(aes(x = Phenotype, y = PRS, color = LastDx_binary)) +
+  geom_boxplot() +
+  labs(title = "ADNI", y = "Scaled PRS", color = "LastDx") + 
+  theme_classic() +
+  theme(text = element_text(family = "ArialMT"))
+p3 <- mcsa_prs_noAPOE %>% 
+  mutate(across(ends_with("PRS"), ~as.numeric(scale(.)))) %>% 
+  pivot_longer(Mem_PRS:HV_PRS, names_to = "Phenotype", values_to = "PRS") %>% 
+  mutate(Phenotype = str_remove(Phenotype, "_PRS"),
+         Phenotype = factor(Phenotype, levels = c("Mem", "LMDR", "HV"))) %>% 
+  drop_na(LastDx_binary) %>% 
+  ggplot(aes(x = Phenotype, y = PRS, color = LastDx_binary)) +
+  geom_boxplot() +
+  labs(title = "MCSA, exclude APOE region", y = "Scaled PRS", color = "LastDx") + 
+  theme_classic() +
+  theme(text = element_text(family = "ArialMT"))
+p4 <- adni_prs_noAPOE %>% 
+  mutate(across(ends_with("PRS"), ~as.numeric(scale(.)))) %>% 
+  pivot_longer(Mem_PRS:HV_PRS, names_to = "Phenotype", values_to = "PRS") %>% 
+  mutate(Phenotype = str_remove(Phenotype, "_PRS"),
+         Phenotype = factor(Phenotype, levels = c("Mem", "LMDR", "HV"))) %>% 
+  drop_na(LastDx_binary) %>% 
+  ggplot(aes(x = Phenotype, y = PRS, color = LastDx_binary)) +
+  geom_boxplot() +
+  labs(title = "ADNI, exclude APOE region", y = "Scaled PRS", color = "LastDx") + 
+  theme_classic() +
+  theme(text = element_text(family = "ArialMT"))
+
+pdf(paste0(outdir, "/1_10/PRSboxplot.pdf"), width = 6, height = 5)
+(p1+p2)/(p3+p4)
+dev.off() # this is in the first rebuttal Rebuttal Fig.15
+
+rm(p1, p2, p3, p4)
+```
+
+
+## Run analysis
+```{r prepare}
+source("./Codes/fns.R")
+# interaction analysis function
+int_fn <- function(data_df,
+                     prs_var,
+                     Y, 
+                     X,
+                     base_covs,
+                     base_covs_for_HV){
+  run_assoc <- function(prs_var, y, x){
+    message("Test association between ", x, "*", prs_var, " and ", y)
+    
+    if (y %in% c("Memory", "LMDR")){
+      m <- lm(paste0(y, " ~ ", x, "*", prs_var, " + ", paste0(base_covs, collapse = " + ")), data = data_df)
+      res_df <- tidy(m, conf.int = T) %>% mutate(X_Var = x, Y_Var = y, PRS = prs_var)
+    }
+    else if (y == "HippVol"){
+      m <- lm(paste0(y, " ~ ", x, "*", prs_var, " + ", paste0(base_covs_for_HV, collapse = " + ")), data = data_df)
+      res_df <- tidy(m, conf.int = T) %>% mutate(X_Var = x, Y_Var = y, PRS = prs_var)
+    }
+    
+    tbl <- tibble(
+      Model = list(m),
+      SummDf = list(res_df)
+    )
+    return(tbl)
+  }
+  
+  # Run for all combinations
+  results <- expand.grid(
+    PRS = prs_var,
+    Y = Y,
+    X = X,
+    stringsAsFactors = F
+  ) %>%
+  filter(Y == "HippVol" & PRS %in% c("HV_PRS", "HV_PRS_noAPOE") | 
+         Y == "LMDR" & PRS %in% c("LMDR_PRS", "LMDR_PRS_noAPOE") |
+         Y == "Memory" & PRS %in% c("Mem_PRS", "Mem_PRS_noAPOE")) %>%
+    mutate(result = pmap(list(PRS, Y, X),
+                         ~ run_assoc(..1, ..2, ..3))) %>%
+    unnest(result)
+  
+  return(results)
+}
+
+
+# read in expression data
+MEs1 <- read.csv(paste0(blwgcna_dir, "/MEs1_SP12.csv")) #from 2_blwgcna.R
+comRes <- readRDS(paste0(residir, "/comRes.rds")) # from 1_CreateResids.R, 
+nduf_bb <- read.csv(paste0(nduf_assoc_dir,"/nduf_bb.csv")) # generated in 4_nduf_assoc_de.R; also in supplementary table 12
+
+# prepare input dataframe for interaction analysis
+mcsa_df <- mcsa_prs %>% 
+  left_join(mcsa_prs_noAPOE %>% 
+              dplyr::select(IID:HV_PRS) %>% 
+              rename_with(~ paste0(.x, "_noAPOE"), ends_with("_PRS"))) %>% 
+  inner_join(MEs1 %>% dplyr::select(SubjectID, ME3)) %>% 
+  inner_join(comRes[1:105, ] %>% as.data.frame() %>% rownames_to_column("SubjectID") %>% dplyr::select(SubjectID, any_of(nduf_bb$gene_id))) %>% 
+  mutate(across(ends_with("PRS"), ~as.numeric(scale(.)))) %>%  # scale the PRS
+  mutate(across(ends_with("PRS_noAPOE"), ~as.numeric(scale(.)))) %>%
+  rename_with(.col = starts_with("ENSG"), ~ nduf_bb$gene_name[match(.x, nduf_bb$gene_id)]) %>%  # rename geneID to gene name of NDUFs
+  dplyr::select(IID, SubjectID, contains("PRS"), everything())
+
+adni_df <- adni_prs %>%
+  left_join(adni_prs_noAPOE %>% 
+              dplyr::select(IID:HV_PRS) %>% 
+              rename_with(~ paste0(.x, "_noAPOE"), ends_with("_PRS"))) %>%
+  dplyr::rename(SubjectID = IID) %>% 
+  inner_join(MEs1 %>% dplyr::select(SubjectID, ME3)) %>% 
+  inner_join(comRes[106:196, ] %>% as.data.frame() %>% rownames_to_column("SubjectID") %>% dplyr::select(SubjectID, any_of(nduf_bb$gene_id))) %>% 
+  mutate(across(ends_with("PRS"), ~as.numeric(scale(.)))) %>%  # scale the PRS
+  mutate(across(ends_with("PRS_noAPOE"), ~as.numeric(scale(.)))) %>%
+  mutate(Mag_HippICV = factor(Mag_HippICV)) %>% 
+  rename_with(.col = starts_with("ENSG"), ~ nduf_bb$gene_name[match(.x, nduf_bb$gene_id)]) %>%   # rename geneID to gene name of NDUFs
+  dplyr::select(SubjectID, contains("PRS"), everything())
+```
+
+```{r run}
+# run the analyses and save the results as RData and organized dataframe
+mcsa_int <- int_fn(
+    data_df = mcsa_df,
+    Y = c("HippVol", "LMDR", "Memory"),
+    X = c("ME3", nduf_bb$gene_name),
+    prs_var = c("Mem_PRS", "LMDR_PRS", "HV_PRS"),
+    base_covs = c("Age", "Sex", "Educ", "PC1", "PC2", "PC3"),
+    base_covs_for_HV = c("Age", "Sex", "Educ", "Hipp_ICV", "PC1", "PC2", "PC3")
+)
+
+adni_int <- int_fn(
+    data_df = adni_df,
+    Y = c("HippVol", "LMDR", "Memory"),
+    X = c("ME3", nduf_bb$gene_name),
+    prs_var = c("Mem_PRS", "LMDR_PRS", "HV_PRS"),
+    base_covs = c("Age", "Sex", "Educ", "PC1", "PC2", "PC3"),
+    base_covs_for_HV = c("Age", "Sex", "Educ", "Hipp_ICV", "Mag_HippICV", "PC1", "PC2", "PC3")
+)
+save(mcsa_int, adni_int, file = paste0(outdir, "/1_10/PRS_Regression_v3.RData"))
+
+mcsa_int_summ <- mcsa_int %>% 
+  dplyr::select(SummDf) %>% 
+  unnest(SummDf) %>% 
+  dplyr::select(Y_Var, X_Var, PRS, everything()) %>% 
+  filter(grepl("\\:", term)) %>% 
+  group_by(Y_Var) %>% 
+  mutate(q.value = p.adjust(p.value, "fdr"), .after = "p.value") #21 multiple testing for 20 NDUFs + ME3
+adni_int_summ <- adni_int %>% 
+  dplyr::select(SummDf) %>% 
+  unnest(SummDf) %>% 
+  dplyr::select(Y_Var, X_Var, PRS, everything()) %>% 
+  filter(grepl("\\:", term)) %>% 
+  group_by(Y_Var) %>% 
+  mutate(q.value = p.adjust(p.value, "fdr"), .after = "p.value")
+```
+
+```{r run - noAPOE}
+mcsa_int_noAPOE <- int_fn(
+    data_df = mcsa_df,
+    Y = c("HippVol", "LMDR", "Memory"),
+    X = c("ME3", nduf_bb$gene_name),
+    prs_var = c("Mem_PRS_noAPOE", "LMDR_PRS_noAPOE", "HV_PRS_noAPOE"),
+    base_covs = c("Age", "Sex", "Educ", "PC1", "PC2", "PC3"),
+    base_covs_for_HV = c("Age", "Sex", "Educ", "Hipp_ICV", "PC1", "PC2", "PC3")
+)
+adni_int_noAPOE <- int_fn(
+    data_df = adni_df,
+    Y = c("HippVol", "LMDR", "Memory"),
+    X = c("ME3", nduf_bb$gene_name),
+    prs_var = c("Mem_PRS_noAPOE", "LMDR_PRS_noAPOE", "HV_PRS_noAPOE"),
+    base_covs = c("Age", "Sex", "Educ", "PC1", "PC2", "PC3"),
+    base_covs_for_HV = c("Age", "Sex", "Educ", "Hipp_ICV", "Mag_HippICV", "PC1", "PC2", "PC3")
+)
+save(mcsa_int_noAPOE, adni_int_noAPOE, file = paste0(outdir, "/1_10/PRS_Regression_noAPOE_v3.RData"))
+
+mcsa_int_summ_noAPOE <- mcsa_int_noAPOE %>% 
+  dplyr::select(SummDf) %>% 
+  unnest(SummDf) %>% 
+  dplyr::select(Y_Var, X_Var, PRS, everything()) %>% 
+  #filter(term %in% c(.$X_Var, .$PRS) | grepl("\\:", term)) %>% 
+  filter(grepl("\\:", term)) %>% 
+  group_by(Y_Var) %>% 
+  mutate(q.value = p.adjust(p.value, "fdr"), .after = "p.value") #21 multiple testing for 20 NDUFs + ME3
+adni_int_summ_noAPOE <- adni_int_noAPOE %>% 
+  dplyr::select(SummDf) %>% 
+  unnest(SummDf) %>% 
+  dplyr::select(Y_Var, X_Var, PRS, everything()) %>% 
+  filter(grepl("\\:", term)) %>% 
+  group_by(Y_Var) %>% 
+  mutate(q.value = p.adjust(p.value, "fdr"), .after = "p.value")
+```
+
+
+Permutation following https://library.virginia.edu/data/articles/testing-significance-permutation-based-methods
+About empirical permutation: https://bioinformatics.org/spower/empirical#:~:text=An%20empirical%20p%2Dvalue%20is%20calculated%20as%20SN,required%20statistical%20significance%20level%20%CE%B1%20to%20achieve.
+```{r permutation fns}
+# this is a function that conducts interaction analysis and then perform permutation
+int_perm <- function(data_df,
+                     prs_var,
+                     Y, 
+                     X,
+                     base_covs,
+                     base_covs_for_HV,
+                     n_perm = 10000){
+  run_perm_assoc <- function(prs_var, y, x){
+    message("Test association between ", x, "*", prs_var, " and ", y)
+    
+    if (y %in% c("Memory", "LMDR")){
+      m <- lm(paste0(y, " ~ ", x, "*", prs_var, " + ", paste0(base_covs, collapse = " + ")), data = data_df)
+    }
+    else if (y == "HippVol"){
+      m <- lm(paste0(y, " ~ ", x, "*", prs_var, " + ", paste0(base_covs_for_HV, collapse = " + ")), data = data_df)
+    }
+    
+    dat <- data_df[!is.na(data_df[[y]]),]
+    
+    # create output data frame to append to
+    output <- data.frame(matrix(data = NA, nrow = n_perm + 1, ncol = length(m$coefficients) - 1))
+    names(output) <- names(m$coefficients)[2:length(m$coefficients)]
+    # append the observed coefficients as part of null distribution
+    output[1,] <- m$coefficients[2:length(m$coefficients)] 
+    for (i in 2:nrow(output)) {
+        new_order <-  sample(nrow(dat))
+        dat$y_perm <- dat[[y]][new_order]   # permute data
+        m_perm <- update(m, y_perm ~ ., data = dat)
+        output[i,] <- m_perm$coefficients[2:length(m_perm$coefficients)]
+        }
+    # calculate p-values, use abs() for a two sided test
+    pval <- apply(output, 2, function(x) length(x[abs(x) >= abs(x[1])])/n_perm)
+
+    tbl <- tibble(
+      OutDf = list(output),
+      PermP = list(pval) # this stores the permuted p-values for each variable in the model
+    )
+    return(tbl)
+  }
+  
+  # Run for all combinations
+  results <- expand.grid(
+    PRS = prs_var,
+    Y = Y,
+    X = X,
+    stringsAsFactors = F
+  ) %>%
+  filter(Y == "HippVol" & PRS %in% c("HV_PRS", "HV_PRS_noAPOE") | 
+         Y == "LMDR" & PRS %in% c("LMDR_PRS", "LMDR_PRS_noAPOE") |
+         Y == "Memory" & PRS %in% c("Mem_PRS", "Mem_PRS_noAPOE")) %>%
+    mutate(result = pmap(list(PRS, Y, X),
+                         ~ run_perm_assoc(..1, ..2, ..3))) %>%
+    unnest(result)
+  
+  return(results)
+}
+
+```
+
+```{r run permutation}
+set.seed(123)
+mcsa_int_perm <- int_perm(
+    data_df = mcsa_df,
+    Y = c("Memory", "LMDR","HippVol"),
+    X = c("ME3", nduf_bb$gene_name),
+    prs_var = c("Mem_PRS", "LMDR_PRS", "HV_PRS"),
+    base_covs = c("Age", "Sex", "Educ", "PC1", "PC2", "PC3"),
+    base_covs_for_HV = c("Age", "Sex", "Educ", "Hipp_ICV", "PC1", "PC2", "PC3")
+)
+adni_int_perm <- int_perm(
+    data_df = adni_df,
+    Y = c("Memory", "LMDR","HippVol"),
+    X = c("ME3", nduf_bb$gene_name),
+    prs_var = c("Mem_PRS", "LMDR_PRS", "HV_PRS"),
+    base_covs = c("Age", "Sex", "Educ", "PC1", "PC2", "PC3"),
+    base_covs_for_HV = c("Age", "Sex", "Educ", "Hipp_ICV", "Mag_HippICV", "PC1", "PC2", "PC3")
+)
+
+save(mcsa_int_perm, adni_int_perm, file = paste0(outdir, "/1_10/PRS_RegressionPerm_v3.RData"))
+
+
+# organize results
+mcsa_int_perm_summ <- mcsa_int_perm %>%
+  mutate(
+    obs_coef = map(OutDf, ~ .x[1, ] %>% as.numeric()), # the first row is the estimates from the initial interaction analysis
+    perm_p   = map(PermP, as.numeric),
+    term     = map(OutDf, names) # term = Memory, LMDR or HippVol
+  ) %>%
+  unnest(c(obs_coef, perm_p, term)) %>%
+  select(PRS, Y, X, term, estimate = obs_coef, perm_p) %>% 
+  # join with original regression summary to get std.error, statistic, conf interval
+  inner_join(mcsa_int_summ %>% 
+              dplyr::select(-estimate), 
+            by = c("PRS", "Y" = "Y_Var", "X" = "X_Var", "term")) %>% 
+  dplyr::select(PRS, Y, term, estimate, p.value, q.value, perm_p, std.error, statistic, conf.low, conf.high) %>% 
+  group_by(Y) %>% 
+  mutate(perm_q = p.adjust(perm_p, "fdr"), .after = "perm_p") %>%  #21 multiple testing for 20 NDUFs + ME3
+  ungroup()
+adni_int_perm_summ <- adni_int_perm %>%
+  mutate(
+    obs_coef = map(OutDf, ~ .x[1, ] %>% as.numeric()),
+    perm_p   = map(PermP, as.numeric),
+    term     = map(OutDf, names)
+  ) %>%
+  unnest(c(obs_coef, perm_p, term)) %>%
+  select(PRS, Y, X, term, estimate = obs_coef, perm_p) %>% 
+  # join with original regression summary to get std.error, statistic, conf interval
+  inner_join(adni_int_summ %>% 
+              dplyr::select(-estimate), 
+            by = c("PRS", "Y" = "Y_Var", "X" = "X_Var", "term")) %>% 
+  dplyr::select(PRS, Y, term, estimate, p.value, q.value, perm_p, std.error, statistic, conf.low, conf.high) %>% 
+  group_by(Y) %>% 
+  mutate(perm_q = p.adjust(perm_p, "fdr"), .after = "perm_p") %>%  #21 multiple testing for 20 NDUFs + ME3
+  ungroup()
+```
+
+```{r meta-analysis}
+meta_df = inner_join(mcsa_int_perm_summ, adni_int_perm_summ, by = c("PRS","Y","term"), suffix = c("_MCSA", "_ADNI")) %>% 
+  column_to_rownames("term")
+
+# this indicates column indices corresponding to estimates and standard error of MCSA and ADNI
+eff_idx1 = which(colnames(meta_df) == "estimate_MCSA")
+eff_idx2 = which(colnames(meta_df) == "estimate_ADNI")
+err_idx1 = which(colnames(meta_df) == "std.error_MCSA")
+err_idx2 = which(colnames(meta_df) == "std.error_ADNI")
+
+# run meta-analysis using the function meta_gen_fn defined above
+meta_raw = meta_df %>% pbapply(1, meta_gen_fn, eff_idx1 = eff_idx1, eff_idx2 = eff_idx2, err_idx1 = err_idx1, err_idx2 = err_idx2)
+
+# Get all fixed-effect results
+fix_res = meta_raw %>%
+  pbsapply(function(x) x$fixed) %>%
+  t() %>%
+  as.data.frame() %>%
+  rename_with(~paste0(.x, "_fixed")) %>%
+  rownames_to_column(var = "term") %>%
+  mutate_all(.funs = ~unlist(.x)) %>% 
+  mutate_all(.funs = ~unname(.x))
+
+# Get all random-effect results
+rand_res = meta_raw %>%
+  pbsapply(function(x) x$random) %>%
+  t() %>%
+  data.frame() %>%
+  rename_with(~paste0(.x, "_random")) %>%
+  rownames_to_column(var = "term") %>%
+  mutate_all(.funs = ~unlist(.x)) %>%
+  mutate_all(.funs = ~unname(.x))
+
+# Get heterogenity meassurments Q, I2, tau2
+het_res = meta_raw %>%
+  map(~.x[c("Q","df.Q","pval.Q","I2", "lower.I2", "upper.I2", "tau2", "se.tau2", "H", "lower.H", "upper.H")]) %>%
+  bind_rows(.id = "term")
+
+# Join the results to the original regression coeffcients
+meta_df = meta_df %>%
+  rownames_to_column(var = "term") %>% 
+  inner_join(fix_res) %>%
+  inner_join(rand_res) %>% 
+  rename_with(~sub("^TE", "beta", .x), everything()) %>%
+  rename_with(~sub("^seTE", "se", .x), everything()) %>%
+  inner_join(het_res, by = "term")
+
+# final meta-analyze dataframe, including adjusting for multiple test correction, determining meta-analyzed beta, p and q-values based on heterogeneity measures I2
+meta_int_PRS = meta_df %>%
+  group_by(Y) %>%
+  mutate(q_random = p.adjust(p_random, method = "fdr"),
+         q_fixed = p.adjust(p_fixed, method = "fdr"),
+         model_meta = ifelse(I2 < 0.25, "Fixed", "Random"),
+         beta_meta = ifelse(model_meta =="Fixed", beta_fixed, beta_random),
+         se_meta = ifelse(model_meta =="Fixed", se_fixed, se_random),
+         p_meta = ifelse(model_meta =="Fixed", p_fixed, p_random),
+         q_meta = ifelse(model_meta =="Fixed", q_fixed, q_random),
+         CI_H_meta = ifelse(model_meta =="Fixed", upper_fixed, upper_random),
+         CI_L_meta = ifelse(model_meta == "Fixed", lower_fixed, lower_random)) %>%
+  dplyr::select(-c(ends_with("_random"), ends_with("_fixed"))) %>% 
+  separate(term, into = c("Gene", "PRS2"), sep = ":") %>% 
+  dplyr::select(-PRS2)
+
+write.xlsx(list(
+  "MCSA_int" = mcsa_int_perm_summ,
+  "ADNI_int" = adni_int_perm_summ,
+  "Meta_int" = meta_int_PRS
+),
+paste0(outdir, "/1_10/PRS_Summ_v3.xlsx")) # these are organized in the first rebuttal Rebuttal Table 23
+
+rm(meta_df, eff_idx1, eff_idx2, err_idx1, err_idx2, meta_raw, fix_res, rand_res, het_res)
+```
+
+```{r run permutation - no APOE}
+set.seed(123)
+mcsa_int_perm_noAPOE <- int_perm(
+    data_df = mcsa_df,
+    Y = c("Memory", "LMDR","HippVol"),
+    X = c("ME3", nduf_bb$gene_name),
+    prs_var = c("Mem_PRS_noAPOE", "LMDR_PRS_noAPOE", "HV_PRS_noAPOE"),
+    base_covs = c("Age", "Sex", "Educ", "PC1", "PC2", "PC3"),
+    base_covs_for_HV = c("Age", "Sex", "Educ", "Hipp_ICV", "PC1", "PC2", "PC3")
+)
+adni_int_perm_noAPOE <- int_perm(
+    data_df = adni_df,
+    Y = c("Memory", "LMDR","HippVol"),
+    X = c("ME3", nduf_bb$gene_name),
+    prs_var = c("Mem_PRS_noAPOE", "LMDR_PRS_noAPOE", "HV_PRS_noAPOE"),
+    base_covs = c("Age", "Sex", "Educ", "PC1", "PC2", "PC3"),
+    base_covs_for_HV = c("Age", "Sex", "Educ", "Hipp_ICV", "Mag_HippICV", "PC1", "PC2", "PC3")
+)
+
+save(mcsa_int_perm_noAPOE, adni_int_perm_noAPOE, file = paste0(outdir, "/1_10/PRS_RegressionPerm_noAPOE_v3.RData"))
+
+
+mcsa_int_perm_summ_noAPOE <- mcsa_int_perm_noAPOE %>%
+  mutate(
+    obs_coef = map(OutDf, ~ .x[1, ] %>% as.numeric()),
+    perm_p   = map(PermP, as.numeric),
+    term     = map(OutDf, names)
+  ) %>%
+  unnest(c(obs_coef, perm_p, term)) %>%
+  select(PRS, Y, X, term, estimate = obs_coef, perm_p) %>% 
+  # join with original regression summary to get std.error, statistic, conf interval
+  inner_join(mcsa_int_summ_noAPOE %>% 
+              dplyr::select(-estimate), 
+            by = c("PRS", "Y" = "Y_Var", "X" = "X_Var", "term")) %>% 
+  dplyr::select(PRS, Y, term, estimate, p.value, q.value, perm_p, std.error, statistic, conf.low, conf.high) %>% 
+  group_by(Y) %>% 
+  mutate(perm_q = p.adjust(perm_p, "fdr"), .after = "perm_p") %>%  #21 multiple testing for 20 NDUFs + ME3
+  ungroup()
+adni_int_perm_summ_noAPOE <- adni_int_perm_noAPOE %>%
+  mutate(
+    obs_coef = map(OutDf, ~ .x[1, ] %>% as.numeric()),
+    perm_p   = map(PermP, as.numeric),
+    term     = map(OutDf, names)
+  ) %>%
+  unnest(c(obs_coef, perm_p, term)) %>%
+  select(PRS, Y, X, term, estimate = obs_coef, perm_p) %>% 
+  # join with original regression summary to get std.error, statistic, conf interval
+  inner_join(adni_int_summ_noAPOE %>% 
+              dplyr::select(-estimate), 
+            by = c("PRS", "Y" = "Y_Var", "X" = "X_Var", "term")) %>% 
+  dplyr::select(PRS, Y, term, estimate, p.value, q.value, perm_p, std.error, statistic, conf.low, conf.high) %>% 
+  group_by(Y) %>% 
+  mutate(perm_q = p.adjust(perm_p, "fdr"), .after = "perm_p") %>%  #21 multiple testing for 20 NDUFs + ME3
+  ungroup()
+```
+
+```{r meta-analysis - no APOE}
+meta_df = inner_join(mcsa_int_perm_summ_noAPOE, adni_int_perm_summ_noAPOE, by = c("PRS","Y","term"), suffix = c("_MCSA", "_ADNI")) %>% 
+  column_to_rownames("term")
+
+# this indicates column indices corresponding to estimates and standard error of MCSA and ADNI
+eff_idx1 = which(colnames(meta_df) == "estimate_MCSA")
+eff_idx2 = which(colnames(meta_df) == "estimate_ADNI")
+err_idx1 = which(colnames(meta_df) == "std.error_MCSA")
+err_idx2 = which(colnames(meta_df) == "std.error_ADNI")
+
+# run meta-analysis using the function meta_gen_fn defined above
+meta_raw = meta_df %>% pbapply(1, meta_gen_fn, eff_idx1 = eff_idx1, eff_idx2 = eff_idx2, err_idx1 = err_idx1, err_idx2 = err_idx2)
+
+# Get all fixed-effect results
+fix_res = meta_raw %>%
+  pbsapply(function(x) x$fixed) %>%
+  t() %>%
+  as.data.frame() %>%
+  rename_with(~paste0(.x, "_fixed")) %>%
+  rownames_to_column(var = "term") %>%
+  mutate_all(.funs = ~unlist(.x)) %>% 
+  mutate_all(.funs = ~unname(.x))
+
+# Get all random-effect results
+rand_res = meta_raw %>%
+  pbsapply(function(x) x$random) %>%
+  t() %>%
+  data.frame() %>%
+  rename_with(~paste0(.x, "_random")) %>%
+  rownames_to_column(var = "term") %>%
+  mutate_all(.funs = ~unlist(.x)) %>%
+  mutate_all(.funs = ~unname(.x))
+
+# Get heterogenity meassurments Q, I2, tau2
+het_res = meta_raw %>%
+  map(~.x[c("Q","df.Q","pval.Q","I2", "lower.I2", "upper.I2", "tau2", "se.tau2", "H", "lower.H", "upper.H")]) %>%
+  bind_rows(.id = "term")
+
+# Join the results to the original regression coeffcients
+meta_df = meta_df %>%
+  rownames_to_column(var = "term") %>% 
+  inner_join(fix_res) %>%
+  inner_join(rand_res) %>% 
+  rename_with(~sub("^TE", "beta", .x), everything()) %>%
+  rename_with(~sub("^seTE", "se", .x), everything()) %>%
+  inner_join(het_res, by = "term")
+
+# final meta-analyze dataframe, including adjusting for multiple test correction, determining meta-analyzed beta, p and q-values based on heterogeneity measures I2
+meta_int_PRS_noAPOE = meta_df %>%
+  group_by(Y) %>%
+  mutate(q_random = p.adjust(p_random, method = "fdr"),
+         q_fixed = p.adjust(p_fixed, method = "fdr"),
+         model_meta = ifelse(I2 < 0.25, "Fixed", "Random"),
+         beta_meta = ifelse(model_meta =="Fixed", beta_fixed, beta_random),
+         se_meta = ifelse(model_meta =="Fixed", se_fixed, se_random),
+         p_meta = ifelse(model_meta =="Fixed", p_fixed, p_random),
+         q_meta = ifelse(model_meta =="Fixed", q_fixed, q_random),
+         CI_H_meta = ifelse(model_meta =="Fixed", upper_fixed, upper_random),
+         CI_L_meta = ifelse(model_meta == "Fixed", lower_fixed, lower_random)) %>%
+  dplyr::select(-c(ends_with("_random"), ends_with("_fixed"))) %>% 
+  separate(term, into = c("Gene", "PRS2"), sep = ":") %>% 
+  dplyr::select(-PRS2)
+
+write.xlsx(list(
+  "MCSA_int" = mcsa_int_perm_summ_noAPOE,
+  "ADNI_int" = adni_int_perm_summ_noAPOE,
+  "Meta_int" = meta_int_PRS_noAPOE
+),
+paste0(outdir, "/1_10/PRS_Summ_noAPOE_v3.xlsx")) # these are organized in the first rebuttal Rebuttal Table 24.
+```

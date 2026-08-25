@@ -1,0 +1,837 @@
+---
+title: "rbt_1_5"
+output: html_document
+date: "2026-02-21"
+---
+
+Author: Wei (Adelyn) Tsai; [tsai.wei\@mayo.edu](mailto:tsai.wei@mayo.edu){.email} If you are using this script, please cite our study This script addresses comment 5 about genetic support from reviewer 1. Chunks with bash are done in linux.
+
+```{r set up}
+suppressPackageStartupMessages(library(tidyverse)) #v2.0.0
+suppressPackageStartupMessages(library(openxlsx)) #v4.2.6.1
+suppressPackageStartupMessages(library(data.table)) #v1.15.4
+suppressPackageStartupMessages(library(pbapply)) #v1.7
+suppressPackageStartupMessages(library(ggh4x)) #v0.2.8
+suppressPackageStartupMessages(library(broom)) #v1.0.6
+suppressPackageStartupMessages(library(coloc)) #5.2.3
+suppressPackageStartupMessages(library(TwoSampleMR)) #0.6.22
+
+# list of input/output directories
+indir <- "./indir"
+residir <- "./outdir/resids"
+blwgcna_dir <- "./outdir/bl_wgcna"
+nduf_assoc_dir <- "./outdir/nduf_assoc_de"
+
+outdir <- "./Rebuttal/outdir"
+
+# source commonly used functions
+source("./Codes/fns.R")
+```
+
+# eQTL files prep
+
+## 1. Generate residuals adjusting for technical covariates
+
+```{r}
+cqn_raw <- read_delim(paste0(indir, "/PaX108_R01resilience_gene_CQN_neg3_postQC_s105.txt"), delim = "\t") # MCSA cqn file for 18046 genes. Each row is a gene and each column is a donor
+adni_mc <- readRDS(paste0(indir,"/ADNI_s91_microarray.rds")) #microarray file for 91 donors from ADNI. This has 10116 protein-coding genes, gene id as column names, donorID as row names
+
+# get the intersecting genes of two expression files
+int_genes <- intersect(subset(cqn_raw, GeneBiotype == "protein_coding")$GeneId, colnames(adni_mc))
+
+# MCSA
+mcsa_covars <- read_delim(paste0(indir,"/R01_Resilience_PAXgene_Covars.txt"), delim = "\t") %>% mutate(ptnum=as.character(ptnum)) #covariates file for MCSA, rows are donor columns are covariates
+mcsa_covars <- mcsa_covars %>% 
+  mutate(
+    PAXgene_flowcell = factor(PAXgene_flowcell), 
+    PAXgene_Batch = factor(PAXgene_Batch) # factorize flowcell and batch
+  )
+## generate residuals
+mcsa_res_eqtl <- cqn_raw %>%
+  filter(GeneId %in% int_genes) %>% 
+  select(-Chromosome, -Start, -End, -Length, -GeneName, -GeneBiotype) %>%
+  column_to_rownames("GeneId") %>% 
+  t() %>% 
+  as.data.frame() %>%
+  rownames_to_column("SubjectID") %>%
+  pivot_longer(!SubjectID, names_to = "Gene", values_to = "GenExpr") %>% 
+  inner_join(mcsa_covars, by=c("SubjectID" = "ptnum")) %>% 
+  group_by(Gene) %>%
+  do(data.frame(., resid = residuals(lm(GenExpr ~ RIN + PAXgene_flowcell + PAXgene_Batch, data=.)))) %>% 
+  dplyr::select(SubjectID, Gene, resid) %>% pivot_wider(names_from = Gene, values_from = resid)
+
+adni_covars <- read_delim(paste0(residir, "/ADNI_s91_covars.txt"), delim = "\t") # a covariate file for ADNI, generated in 1_CreateResids.R
+adni_covars <- adni_covars %>% mutate(PTGENDER = factor(PTGENDER))
+## generate residuals
+adni_res_eqtl <- adni_mc %>% 
+  rownames_to_column("SubjectID") %>%
+  pivot_longer(!SubjectID, names_to = "Gene", values_to = "GenExpr") %>% 
+  inner_join(adni_covars) %>% 
+  drop_na() %>% 
+  group_by(Gene) %>%
+  do(data.frame(., resid = residuals(lm(GenExpr ~ RIN + AffyPlate.meanREE + SITE.meanREE, data=.)))) %>% 
+  dplyr::select(SubjectID, Gene, resid) %>% pivot_wider(names_from = Gene, values_from = resid)
+
+# save the residuals for later use
+save(mcsa_res_eqtl, adni_res_eqtl, file = paste0(outdir, "/1_5/Resilience_Residuals_eQTL.RData"))
+```
+
+## 2. eQTL covariates files
+
+```{r}
+# MCSA 
+mcsa_covars_eqtl <- read_delim(paste0(indir, "/mcsa_eqtl_covar.txt"), delim = "\t") # a file with eqtl IID
+mcsa_covars_eqtl %>% 
+  mutate(ptnum = as.character(ptnum)) %>% 
+  dplyr::select(FID:ptnum) %>% 
+  inner_join(mcsa_covars %>% dplyr::select(ptnum, Sex, PAXgene_Age) %>% dplyr::rename(Age = PAXgene_Age)) %>% 
+  write_delim(paste0(outdir, "/1_5/mcsa_covars_eqtl.txt"), delim = "\t") # include id, sex, age at blood collection as covariates
+# ADNI
+adni_covars %>% 
+  dplyr::select(SubjectID, PTGENDER, AGE_EXAM) %>% 
+  dplyr::rename(Sex = PTGENDER, Age = AGE_EXAM)  %>% 
+  write_delim(paste0(outdir, "/1_5/adni_covars_eqtl.txt"), delim = "\t") # include id, sex, age at blood collection as covariates
+```
+
+# Examine eQTL results
+
+eQTL was run using this script: rbt_1_5_run_cisQTL_NDUFs_021726.R
+PLINK meta-analysis: BETA in both input and output are with respect to the A1 allele. I.e. if it's greater than 1, that implies the A1 allele increases risk relative to A2.
+```{r}
+ndufs_eqtl <- readRDS(paste0(outdir, "/1_5/ADNI_R01_Resilience_Blood_cisQTL_metaAnalysis_021726.rds"))
+# Adjust the results by FDR
+ndufs_eqtl <- ndufs_eqtl %>% mutate(FDR = p.adjust(`P(R)`, method = "fdr"), .after = "P(R)") # A1=effect allele
+sig_eqtl <- ndufs_eqtl %>% filter(FDR < 0.05) #810
+saveRDS(sig_eqtl, paste0(outdir, "/1_5/sig_eqtl.rds"))
+# sort the two allels based on lexicographic order 
+# we did this so we can have consistent naming of the SNPs across multiple results
+a_low <- pmin(sig_eqtl$A1, sig_eqtl$A2)
+a_high <- pmax(sig_eqtl$A1, sig_eqtl$A2)
+sig_eqtl <- sig_eqtl %>% 
+  mutate(SNP_rename = paste0(sig_eqtl$CHR, ":", sig_eqtl$BP, ":", a_low, ":", a_high), .after = "SNP")#rename SNP field to be consistent with bim files
+rm(a_low, a_high)
+
+sig_eqtl %>% 
+  dplyr::select(SNP_rename, `P(R)`) %>% 
+  rename(SNP = SNP_rename, P = `P(R)`) %>% 
+  write_delim(paste0(outdir, "/1_5/sig_eqtl_forCLUMP.txt"), delim = "\t")
+```
+
+Next, we clumped the significant eQTL to identify significant lead eQTL. We used the LD reference panel from 1000 genome project prepared in 1_10_PRSv3.Rmd
+
+```{bash clump}
+ld_dir="./indir/LDRef_PLINK2" # the LD files with updated variant IDs are done in rbt_1_10_PRSv3.Rmd
+outdir="./Rebuttal/outdir/1_5"
+
+plink \
+  --bfile "${ld_dir}/EUR.Ref.nors.lexicoID" \
+  --clump "${outdir}/sig_eqtl_forCLUMP.txt" \
+  --clump-r2 0.001 \
+  --clump-kb 10000 \
+  --clump-p1 1 \
+  --clump-p2 1 \
+  --out "${outdir}/sig_eqtl_clumpV3" # the r2 and kb parameters are from Dr.Winham's paper; also in this paper: https://pmc.ncbi.nlm.nih.gov/articles/PMC12462376/; and in TwoSampleMR: https://mrcieu.github.io/TwoSampleMR/reference/clump_data.html; # use this results
+awk 'NR>1 {print $3}' "${outdir}/sig_eqtl_clumpV3.clumped" > "${outdir}/lead_sigeqtlV3.txt" #write the 3rd column, SNP, to a file for extracting them later
+```
+
+Then, we acquired genotype information for those lead eQTL from MCSA and ADNI,
+
+```{bash recode-A}
+wgs_dir="./Rebuttal/outdir/1_10/plink_outs" # the WGS files with updated variant IDs are done in rbt_1_10_PRSv3.Rmd
+
+plink \
+  --bfile "${wgs_dir}/ADNI_WGS_CSHRP_GBHNF_UpdatedIIDs_HG38_UpdatedVarID" \
+  --recode Av \
+  --allow-extra-chr \
+  --extract "${outdir}/lead_sigeqtlV3.txt" \
+  --out "${outdir}/lead_sigeqtl_geno_ADNI_V3"
+  
+plink \
+  --bfile "${wgs_dir}/MCSA_WGS_CHR1_22_UpdatedVarID" \
+  --recode Av \
+  --allow-extra-chr \
+  --extract "${outdir}/lead_sigeqtlV3.txt" \
+  --out "${outdir}/lead_sigeqtl_geno_MCSA_V3"
+```
+
+
+
+## Examined the lead sig eQTL and the genotype file
+.traw: COUNTED	Counted allele (defaults to A1)
+```{r}
+clump_result <- read.table(paste0(outdir, "/1_5/sig_eqtl_clumpV3.clumped"), header = T, stringsAsFactors = F, quote = "") #11 SNPs
+# filter sig_eqtl dataframe to contain only the clumped independent lead SNPs
+clumped_eqtl <- sig_eqtl %>% filter(SNP_rename %in% clump_result$SNP)
+write.xlsx(clumped_eqtl, paste0(outdir, "/1_5/clumpled_eqtl.xlsx"))
+
+# organize the traw files of MCSA and ADNI to long format for later use;
+# also rename rsid that's NA manually
+mcsa_traw <- read.table(paste0(outdir, "/1_5/lead_sigeqtl_geno_MCSA_V3.traw"), header = T, stringsAsFactors = F, quote = "") %>% 
+  rename_with(.cols = 7:ncol(.), ~ gsub("^X0_", "", .)) %>% 
+  #mutate(across(7:ncol(.), ~ factor(.))) %>% 
+  pivot_longer(cols = 7:ncol(.), names_to = "IID", values_to = "Dose") %>% 
+  left_join(clumped_eqtl %>% 
+               dplyr::select(SNP_rename, rsid, gene_name), by=c("SNP" = "SNP_rename")) %>% 
+  dplyr::select(CHR, SNP, rsid, gene_name, everything())
+unique(mcsa_traw$SNP[which(is.na(mcsa_traw$rsid))]) # "11:78067306:A:G" -- these SNPs' rsid are NA
+# 11:78067306:A:G = rs634768 according to dbSNP
+mcsa_traw <- mcsa_traw %>% mutate(rsid = case_when(SNP == "11:78067306:A:G" ~ "rs634768", TRUE ~ rsid))
+  
+adni_traw <- read.table(paste0(outdir, "/1_5/lead_sigeqtl_geno_ADNI_V3.traw"), header = T, stringsAsFactors = F, quote = "") %>% 
+  rename_with(.cols = 7:ncol(.), ~ gsub("^X0_", "", .)) %>% 
+  #mutate(across(7:ncol(.), ~ factor(.))) %>% 
+  pivot_longer(cols = 7:ncol(.), names_to = "IID", values_to = "Dose") %>% 
+  left_join(clumped_eqtl %>% 
+               dplyr::select(SNP_rename, rsid, gene_name), by=c("SNP" = "SNP_rename")) %>% 
+  dplyr::select(CHR, SNP, rsid, gene_name, everything()) %>% 
+  mutate(rsid = case_when(SNP == "11:78067306:A:G" ~ "rs634768", TRUE ~ rsid))
+
+```
+
+
+## Check against Bellenguez GWAS summary stats
+
+Check if any of our significant eQTL is in significant loci highlighted in Bellenguez
+
+```{r Bellenguez results}
+st5 <- read.xlsx(paste0(indir, "/Bellenguez/harmonized/Bellenguez_ST5.xlsx")) # from Bellenguez et al supplementary table 5. these are loci reaching genome-wide significance
+st5 <- st5 %>% mutate(CHR_POS = paste0(Chr, ":", Position), .after = "Position")
+
+bellenguez_h <- data.table::fread(paste0(indir, "/Bellenguez/harmonized/35379992-GCST90027158-MONDO_0004975.h.tsv.gz")) # bellenguez harmonized summary stats from GWAS catalog
+
+# check whether any of the significant cis-eqtl from our study is 500kb from any of the AD GWAS SNPs in Bellenguez
+bell_sig_summ <- bellenguez_h %>% filter(hm_rsid %in% st5$Variant)
+
+eqtl_adrisk = list()
+for (i in 1:nrow(bell_sig_summ)){
+  chr = bell_sig_summ$hm_chrom[i]
+  pos = bell_sig_summ$hm_pos[i]
+  rsid = bell_sig_summ$hm_rsid[i]
+  
+  upper = pos + 500000
+  lower = pos - 500000
+  
+  sub_eqtl = sig_eqtl %>% filter(CHR == chr) %>% filter(BP <= upper & BP >= lower)
+  
+  eqtl_adrisk[[rsid]] <- sub_eqtl
+}
+eqtl_adrisk <- bind_rows(eqtl_adrisk, .id = "ADRisk_rsid")
+write.xlsx(eqtl_adrisk, paste0(outdir, "/1_5/Sig_eQTL_ADRisk.xlsx")) # the results are organized in first rebuttal Rebuttal Table 7
+
+rm(i, chr, pos, rsid, upper, lower, sub_eqtl)
+```
+
+# Colocalization
+We found SNPs in NDUFB1 and NDUFA9 that are 500kb from AD GWAS SNPs in Bellenguez, so we performed colocalization.
+All the colocalization results are organized in the first rebuttal Rebuttal Table 8
+## NDUFB1, rs7401792
+```{r}
+chr <- 14
+pos <- 92464917 # position of rs7401792
+
+# acquire all SNPs in our eQTL study and in Bellenguez that are 500kb from rs740192
+eqtl_ndufb1 <- ndufs_eqtl %>% filter(CHR == chr & BP >= pos - 500000 & BP <= pos + 500000) %>% filter(gene_name == "NDUFB1")
+bell_ndufb1 <- bellenguez_h %>% filter(hm_chrom == chr & hm_pos >= pos - 500000 & hm_pos <= pos + 500000)
+bell_ndufb1$SNP <- paste0(bell_ndufb1$hm_chrom, ":", bell_ndufb1$hm_pos)
+
+#Get only SNPs present in both datasets
+overlap <- intersect(eqtl_ndufb1$SNP, bell_ndufb1$SNP) #3182 SNPs
+eqtl_ndufb1 <- eqtl_ndufb1 %>% filter(SNP %in% overlap)
+bell_ndufb1 <- bell_ndufb1 %>% filter(SNP %in% overlap)
+
+#Make sure the alleles are aligned in direction of effect
+#Aligning the GWAS betas to the tested alleles of the eQTL
+ndufb1_aligned <- bell_ndufb1 %>% 
+  mutate(varbeta = standard_error^2, N = n_cas + n_con) %>% 
+  dplyr::select(SNP, hm_rsid, hm_chrom, hm_pos, hm_effect_allele, hm_other_allele, hm_beta, varbeta, N) %>% 
+  left_join(
+    eqtl_ndufb1 %>% 
+      mutate(N = 193) %>% #102 people in MCSA and 91 people in ADNI have genetic data for eQTL analysis
+      # plink meta-analysis doesn't produce SE so we manually calculate it. These two formula produce the same results: 
+          ## 1. abs(beta/ qnorm(p/tail)) (tail = 2) (https://www.biostars.org/p/431875/)
+          ## 2. sqrt(((BETA)^2)/qchisq(P,1,lower.tail=F)) (https://groups.google.com/g/plink2-users/c/6g9GM3KcrlI)
+      mutate(SE = abs(`BETA(R)` / qnorm(`P(R)`/2)), varbeta = SE^2, .after = "BETA(R)") %>%  
+      dplyr::select(SNP, rsid, CHR, BP, A1, A2, `BETA(R)`, `P(R)`, varbeta, N),
+    by = "SNP"
+  ) %>% 
+  mutate(beta_align = ifelse(hm_effect_allele == A1, hm_beta, -hm_beta), 
+         check = ifelse(hm_effect_allele == A1, TRUE, FALSE),
+         check2 = case_when(
+           hm_effect_allele == A1 & hm_other_allele == A2 ~ TRUE, # this is what we want
+           hm_effect_allele == A2 & hm_other_allele == A1 ~ TRUE, # this can be resolved by sorting lexicographically (below)
+           TRUE ~ FALSE # check for both effect and other alleles
+         )) # there are two alleles that check2 fail, remove them. 
+
+a_low <- pmin(ndufb1_aligned$A1, ndufb1_aligned$A2)
+a_high <- pmax(ndufb1_aligned$A1, ndufb1_aligned$A2)
+ndufb1_aligned <- ndufb1_aligned %>% 
+  mutate(SNP_rename = paste0(ndufb1_aligned$CHR, ":", ndufb1_aligned$BP, ":", a_low, ":", a_high), .after = "SNP")#rename SNP field to be consistent with LD bim files
+rm(a_low, a_high)
+write.table(ndufb1_aligned$SNP_rename, paste0(outdir, "/1_5/ndufb1_aligned_snps.txt"), sep = "\t", col.names = F, quote = F, row.names = F)
+```
+
+
+```{bash}
+wgs_dir="./Rebuttal/outdir/1_10/plink_outs" # the WGS files with updated variant IDs are done in rbt_1_10_PRSv3.Rmd
+outdir="./Rebuttal/outdir/1_5"
+
+# calculate allele frequency for NDUFB1 SNPs
+plink \
+  --bfile "${wgs_dir}/ADNI_WGS_CSHRP_GBHNF_UpdatedIIDs_HG38_UpdatedVarID" \
+  --freq \
+  --allow-extra-chr \
+  --extract "${outdir}/ndufb1_aligned_snps.txt" \
+  --out "${outdir}/ndufb1_snps_freq_ADNI"
+  
+plink \
+  --bfile "${wgs_dir}/MCSA_WGS_CHR1_22_UpdatedVarID" \
+  --freq \
+  --allow-extra-chr \
+  --extract "${outdir}/ndufb1_aligned_snps.txt" \
+  --out "${outdir}/ndufb1_snps_freq_MCSA"
+```
+
+```{r}
+# prepare colocalization input from Bellenguez
+## need to remove beta with NA or will receive error when doing check_dataset()
+## need to remove beta = 0 or will receive this error: Error in if (min(p) > warn.minp) warning("minimum p value is: ", format.pval(min(p)),  : 
+  # missing value where TRUE/FALSE needed
+bell_ndufb1_forcoloc <- ndufb1_aligned %>% 
+  filter(check2 != FALSE) %>% 
+  drop_na(hm_beta) %>% 
+  filter(`BETA(R)` != 0) %>%  
+  dplyr::select(hm_beta, varbeta.x, SNP_rename, hm_pos, N.x) %>% 
+  rename(beta = hm_beta, varbeta = varbeta.x, snp = SNP_rename, position = hm_pos, N = N.x) %>% 
+  as.list()
+bell_ndufb1_forcoloc$type = "cc"
+check_dataset(bell_ndufb1_forcoloc)
+
+# We need EAF because we don't know the sdY
+## sdY should be the standard deviation of residuals but because I'm using eQTL results from meta-analysis, I can't just take either one of sd of residuals from MCSA or ADNI, therefore I estimated the MAF from MCSA and do a sample-size weighted average MAF.
+eaf_ndufb1_mcsa <- read.table(paste0(outdir, "/1_5/ndufb1_snps_freq_MCSA.frq"), header = T, stringsAsFactors = F, quote = "")
+eaf_ndufb1_adni <- read.table(paste0(outdir, "/1_5/ndufb1_snps_freq_ADNI.frq"), header = T, stringsAsFactors = F, quote = "")
+maf_ndufb1_meta <- eaf_ndufb1_mcsa %>% left_join(eaf_ndufb1_adni, by=c("CHR", "SNP"), suffix = c("_MCSA", "_ADNI"))
+maf_ndufb1_meta <- maf_ndufb1_meta %>% 
+  mutate(check = case_when(
+           A1_MCSA == A1_ADNI & A2_MCSA == A2_ADNI ~ TRUE,
+           A1_MCSA == A2_ADNI & A2_MCSA == A1_ADNI ~ TRUE,
+           TRUE ~ FALSE # check this for both effect and other alleles
+         )) %>% #all TRUE
+  mutate(MAF_ADNI_aligned = ifelse(A1_MCSA == A1_ADNI, MAF_ADNI, 1-MAF_ADNI)) %>% 
+  # do a sample-size-weighted average MAF
+  mutate(MAF_meta = (MAF_MCSA * NCHROBS_MCSA/2 + MAF_ADNI * NCHROBS_ADNI/2) / (NCHROBS_MCSA/2 + NCHROBS_ADNI/2),
+         MAF_meta_final = pmin(MAF_meta, 1 - MAF_meta))
+all.equal(maf_ndufb1_meta$MAF_meta, maf_ndufb1_meta$MAF_meta_final) #TRUE
+
+# prepare colocalizatin input from eQTL
+eqtl_ndufb1_forcoloc <- ndufb1_aligned %>% 
+  left_join(maf_ndufb1_meta %>% dplyr::select(SNP, MAF_meta_final), by=c("SNP_rename" = "SNP")) %>% 
+  filter(check2 != FALSE) %>% 
+  drop_na(hm_beta) %>% 
+  filter(`BETA(R)` != 0) %>% 
+  dplyr::select(`BETA(R)`, varbeta.y, SNP_rename, BP, MAF_meta_final) %>% 
+  rename(beta = `BETA(R)`, varbeta = varbeta.y, snp = SNP_rename, position = BP, MAF = MAF_meta_final) %>% 
+  as.list()
+eqtl_ndufb1_forcoloc$N = 193
+eqtl_ndufb1_forcoloc$type = "quant"
+check_dataset(eqtl_ndufb1_forcoloc)
+
+
+# run coloc
+ndufb1_coloc <- coloc.abf(dataset1=bell_ndufb1_forcoloc, dataset2=eqtl_ndufb1_forcoloc) # "PP abf for shared variant: 3.87%"
+#PP.H0.abf PP.H1.abf PP.H2.abf PP.H3.abf PP.H4.abf 
+ #2.61e-09  6.54e-01  1.23e-09  3.07e-01  3.87e-02 
+```
+
+## NDUFB1, rs12590654
+```{r}
+chr <- 14
+pos <- 92472511 # position for rs12590654
+
+# acquire all SNPs in our eQTL study and in Bellenguez that are 500kb from rs12590654
+eqtl_ndufb1_pos2 <- ndufs_eqtl %>% filter(CHR == chr & BP >= pos - 500000 & BP <= pos + 500000) %>% filter(gene_name == "NDUFB1")
+bell_ndufb1_pos2 <- bellenguez_h %>% filter(hm_chrom == chr & hm_pos >= pos - 500000 & hm_pos <= pos + 500000)
+bell_ndufb1_pos2$SNP <- paste0(bell_ndufb1_pos2$hm_chrom, ":", bell_ndufb1_pos2$hm_pos)
+
+#Get only SNPs present in both datasets
+overlap <- intersect(eqtl_ndufb1_pos2$SNP, bell_ndufb1_pos2$SNP) #3188 SNPs
+eqtl_ndufb1_pos2 <- eqtl_ndufb1_pos2 %>% filter(SNP %in% overlap)
+bell_ndufb1_pos2 <- bell_ndufb1_pos2 %>% filter(SNP %in% overlap)
+
+#Make sure the alleles are alligned in direction of effect
+#Aligning the GWAS betas to the tested alleles of the eQTL
+ndufb1_pos2_aligned <- bell_ndufb1_pos2 %>% 
+  mutate(varbeta = standard_error^2, N = n_cas + n_con) %>% 
+  dplyr::select(SNP, hm_rsid, hm_chrom, hm_pos, hm_effect_allele, hm_other_allele, hm_beta, varbeta, N) %>% 
+  left_join(
+    eqtl_ndufb1_pos2 %>% 
+      mutate(N = 193) %>% #102 people in MCSA and 91 people in ADNI have genetic data for eQTL analysis
+      # plink meta-analysis doesn't produce SE so we manually calculate it. These two formula produce the same results: 
+          ## 1. abs(beta/ qnorm(p/tail)) (tail = 2) (https://www.biostars.org/p/431875/)
+          ## 2. sqrt(((BETA)^2)/qchisq(P,1,lower.tail=F)) (https://groups.google.com/g/plink2-users/c/6g9GM3KcrlI)
+      mutate(SE = abs(`BETA(R)` / qnorm(`P(R)`/2)), varbeta = SE^2, .after = "BETA(R)") %>%  
+      dplyr::select(SNP, rsid, CHR, BP, A1, A2, `BETA(R)`, `P(R)`, varbeta, N),
+    by = "SNP"
+  ) %>% 
+  mutate(beta_align = ifelse(hm_effect_allele == A1, hm_beta, -hm_beta), 
+         check = ifelse(hm_effect_allele == A1, TRUE, FALSE),
+         check2 = case_when(
+           hm_effect_allele == A1 & hm_other_allele == A2 ~ TRUE, # this is what we want
+           hm_effect_allele == A2 & hm_other_allele == A1 ~ TRUE, # this can be resolved by sorting lexicographically (below)
+           TRUE ~ FALSE # check for both effect and other alleles
+         )) # there are two alleles that check2 fail, remove them. 
+
+a_low <- pmin(ndufb1_pos2_aligned$A1, ndufb1_pos2_aligned$A2)
+a_high <- pmax(ndufb1_pos2_aligned$A1, ndufb1_pos2_aligned$A2)
+ndufb1_pos2_aligned <- ndufb1_pos2_aligned %>% 
+  mutate(SNP_rename = paste0(ndufb1_pos2_aligned$CHR, ":", ndufb1_pos2_aligned$BP, ":", a_low, ":", a_high), .after = "SNP")#rename SNP field to be consistent with LD bim files
+rm(a_low, a_high)
+write.table(ndufb1_pos2_aligned$SNP_rename, paste0(outdir, "/1_5/ndufb1_pos2_aligned_snps.txt"), sep = "\t", col.names = F, quote = F, row.names = F)
+```
+
+
+```{bash}
+wgs_dir="./Rebuttal/outdir/1_10/plink_outs"
+outdir="./Rebuttal/outdir/1_5"
+
+
+# calculate allele frequency for NDUFB1 SNPs
+plink \
+  --bfile "${wgs_dir}/ADNI_WGS_CSHRP_GBHNF_UpdatedIIDs_HG38_UpdatedVarID" \
+  --freq \
+  --allow-extra-chr \
+  --extract "${outdir}/ndufb1_pos2_aligned_snps.txt" \
+  --out "${outdir}/ndufb1_pos2_snps_freq_ADNI"
+  
+plink \
+  --bfile "${wgs_dir}/MCSA_WGS_CHR1_22_UpdatedVarID" \
+  --freq \
+  --allow-extra-chr \
+  --extract "${outdir}/ndufb1_pos2_aligned_snps.txt" \
+  --out "${outdir}/ndufb1_pos2_snps_freq_MCSA"
+```
+
+```{r}
+# prepare colocalization input from Bellenguez
+## need to remove beta with NA or will receive error when doing check_dataset()
+## need to remove beta = 0 or will receive this error: Error in if (min(p) > warn.minp) warning("minimum p value is: ", format.pval(min(p)),  : 
+  # missing value where TRUE/FALSE needed
+bell_ndufb1_pos2_forcoloc <- ndufb1_pos2_aligned %>% 
+  filter(check2 != FALSE) %>% 
+  drop_na(hm_beta) %>% 
+  filter(`BETA(R)` != 0) %>% 
+  dplyr::select(hm_beta, varbeta.x, SNP_rename, hm_pos, N.x) %>% 
+  rename(beta = hm_beta, varbeta = varbeta.x, snp = SNP_rename, position = hm_pos, N = N.x) %>% 
+  as.list()
+bell_ndufb1_pos2_forcoloc$type = "cc"
+check_dataset(bell_ndufb1_pos2_forcoloc)
+
+# We need EAF because we don't know the sdY
+## sdY should be the standard deviation of residuals but because I'm using eQTL results from meta-analysis, I can't just take either one of sd of residuals from MCSA or ADNI, therefore I estimated the MAF from MCSA and do a sample-size weighted average MAF.
+eaf_ndufb1_pos2_mcsa <- read.table(paste0(outdir, "/1_5/ndufb1_pos2_snps_freq_MCSA.frq"), header = T, stringsAsFactors = F, quote = "")
+eaf_ndufb1_pos2_adni <- read.table(paste0(outdir, "/1_5/ndufb1_pos2_snps_freq_ADNI.frq"), header = T, stringsAsFactors = F, quote = "")
+maf_ndufb1_pos2_meta <- eaf_ndufb1_pos2_mcsa %>% left_join(eaf_ndufb1_pos2_adni, by=c("CHR", "SNP"), suffix = c("_MCSA", "_ADNI"))
+maf_ndufb1_pos2_meta <- maf_ndufb1_pos2_meta %>% 
+  mutate(check = case_when(
+           A1_MCSA == A1_ADNI & A2_MCSA == A2_ADNI ~ TRUE,
+           A1_MCSA == A2_ADNI & A2_MCSA == A1_ADNI ~ TRUE,
+           TRUE ~ FALSE # check this for both effect and other alleles
+         )) %>% #all TRUE
+  mutate(MAF_ADNI_aligned = ifelse(A1_MCSA == A1_ADNI, MAF_ADNI, 1-MAF_ADNI)) %>% 
+  mutate(MAF_meta = (MAF_MCSA * NCHROBS_MCSA/2 + MAF_ADNI * NCHROBS_ADNI/2) / (NCHROBS_MCSA/2 + NCHROBS_ADNI/2),
+         MAF_meta_final = pmin(MAF_meta, 1 - MAF_meta))
+all.equal(maf_ndufb1_pos2_meta$MAF_meta, maf_ndufb1_pos2_meta$MAF_meta_final) #TRUE
+
+# prepare coloc input from eQTL
+eqtl_ndufb1_pos2_forcoloc <- ndufb1_pos2_aligned %>% 
+  left_join(maf_ndufb1_pos2_meta %>% dplyr::select(SNP, MAF_meta_final), by=c("SNP_rename" = "SNP")) %>% 
+  filter(check2 != FALSE) %>% 
+  drop_na(hm_beta) %>% 
+  filter(`BETA(R)` != 0) %>% 
+  dplyr::select(`BETA(R)`, varbeta.y, SNP_rename, BP, MAF_meta_final) %>% 
+  rename(beta = `BETA(R)`, varbeta = varbeta.y, snp = SNP_rename, position = BP, MAF = MAF_meta_final) %>% 
+  as.list()
+eqtl_ndufb1_pos2_forcoloc$N = 193
+eqtl_ndufb1_pos2_forcoloc$type = "quant"
+check_dataset(eqtl_ndufb1_pos2_forcoloc)
+
+# run coloc
+ndufb1_pos2_coloc <- coloc.abf(dataset1=bell_ndufb1_pos2_forcoloc, dataset2=eqtl_ndufb1_pos2_forcoloc) # "PP abf for shared variant: 3.88%"
+#PP.H0.abf PP.H1.abf PP.H2.abf PP.H3.abf PP.H4.abf 
+ #2.62e-09  6.55e-01  1.23e-09  3.07e-01  3.88e-02 
+```
+
+## NDUFA3, rs587709
+```{r}
+chr <- 19
+pos <- 54267597 # position for rs587709
+
+# acquire all SNPs in our eQTL study and in Bellenguez that are 500kb from rs740192
+eqtl_ndufa3 <- ndufs_eqtl %>% filter(CHR == chr & BP >= pos - 500000 & BP <= pos + 500000) %>% filter(gene_name == "NDUFA3")
+bell_ndufa3 <- bellenguez_h %>% filter(hm_chrom == chr & hm_pos >= pos - 500000 & hm_pos <= pos + 500000)
+bell_ndufa3$SNP <- paste0(bell_ndufa3$hm_chrom, ":", bell_ndufa3$hm_pos)
+
+#Get only SNPs present in both datasets
+overlap <- intersect(eqtl_ndufa3$SNP, bell_ndufa3$SNP) #2616 SNPs
+eqtl_ndufa3 <- eqtl_ndufa3 %>% filter(SNP %in% overlap)
+bell_ndufa3 <- bell_ndufa3 %>% filter(SNP %in% overlap)
+
+#Make sure the alleles are alligned in direction of effect
+#Aligning the GWAS betas to the tested alleles of the eQTL
+ndufa3_aligned <- bell_ndufa3 %>% 
+  mutate(varbeta = standard_error^2, N = n_cas + n_con) %>% 
+  dplyr::select(SNP, hm_rsid, hm_chrom, hm_pos, hm_effect_allele, hm_other_allele, hm_beta, varbeta, N) %>% 
+  left_join(
+    eqtl_ndufa3 %>% 
+      mutate(N = 193) %>% #102 people in MCSA and 91 people in ADNI have genetic data for eQTL analysis
+      # plink meta-analysis doesn't produce SE so we manually calculate it. These two formula produce the same results: 
+          ## 1. abs(beta/ qnorm(p/tail)) (tail = 2) (https://www.biostars.org/p/431875/)
+          ## 2. sqrt(((BETA)^2)/qchisq(P,1,lower.tail=F)) (https://groups.google.com/g/plink2-users/c/6g9GM3KcrlI)
+      mutate(SE = abs(`BETA(R)` / qnorm(`P(R)`/2)), varbeta = SE^2, .after = "BETA(R)") %>%  
+      dplyr::select(SNP, rsid, CHR, BP, A1, A2, `BETA(R)`, `P(R)`, varbeta, N),
+    by = "SNP"
+  ) %>% 
+  mutate(beta_align = ifelse(hm_effect_allele == A1, hm_beta, -hm_beta), 
+         check = ifelse(hm_effect_allele == A1, TRUE, FALSE),
+         check2 = case_when(
+           hm_effect_allele == A1 & hm_other_allele == A2 ~ TRUE, # this is what we want
+           hm_effect_allele == A2 & hm_other_allele == A1 ~ TRUE, # this can be resolved by sorting lexicographically (below)
+           TRUE ~ FALSE # check for both effect and other alleles
+         )) # there are two alleles that check2 fail, remove them. 
+
+a_low <- pmin(ndufa3_aligned$A1, ndufa3_aligned$A2)
+a_high <- pmax(ndufa3_aligned$A1, ndufa3_aligned$A2)
+ndufa3_aligned <- ndufa3_aligned %>% 
+  mutate(SNP_rename = paste0(ndufa3_aligned$CHR, ":", ndufa3_aligned$BP, ":", a_low, ":", a_high), .after = "SNP")#rename SNP field to be consistent with LD bim files
+rm(a_low, a_high)
+write.table(ndufa3_aligned$SNP_rename, paste0(outdir, "/1_5/ndufa3_aligned_snps.txt"), sep = "\t", col.names = F, quote = F, row.names = F)
+```
+
+
+```{bash}
+wgs_dir="./Rebuttal/outdir/1_10/plink_outs"
+outdir="./Rebuttal/outdir/1_5"
+
+
+# calculate allele frequency for NDUFA3 SNPs
+plink \
+  --bfile "${wgs_dir}/ADNI_WGS_CSHRP_GBHNF_UpdatedIIDs_HG38_UpdatedVarID" \
+  --freq \
+  --allow-extra-chr \
+  --extract "${outdir}/ndufa3_aligned_snps.txt" \
+  --out "${outdir}/ndufa3_snps_freq_ADNI"
+  
+plink \
+  --bfile "${wgs_dir}/MCSA_WGS_CHR1_22_UpdatedVarID" \
+  --freq \
+  --allow-extra-chr \
+  --extract "${outdir}/ndufa3_aligned_snps.txt" \
+  --out "${outdir}/ndufa3_snps_freq_MCSA"
+```
+
+```{r}
+# prepare colocalization input from Bellenguez
+## need to remove beta with NA or will receive error when doing check_dataset()
+## need to remove beta = 0 or will receive this error: Error in if (min(p) > warn.minp) warning("minimum p value is: ", format.pval(min(p)),  : 
+  # missing value where TRUE/FALSE needed
+bell_ndufa3_forcoloc <- ndufa3_aligned %>% 
+  filter(check2 != FALSE) %>% 
+  drop_na(hm_beta) %>% 
+  filter(`BETA(R)` != 0) %>% 
+  dplyr::select(hm_beta, varbeta.x, SNP_rename, hm_pos, N.x) %>% 
+  rename(beta = hm_beta, varbeta = varbeta.x, snp = SNP_rename, position = hm_pos, N = N.x) %>% 
+  as.list()
+bell_ndufa3_forcoloc$type = "cc"
+check_dataset(bell_ndufa3_forcoloc)
+
+# We need EAF because we don't know the sdY
+## sdY should be the standard deviation of residuals but because I'm using eQTL results from meta-analysis, I can't just take either one of sd of residuals from MCSA or ADNI, therefore I estimated the MAF from MCSA and do a sample-size weighted average MAF.
+eaf_ndufa3_mcsa <- read.table(paste0(outdir, "/1_5/ndufa3_snps_freq_MCSA.frq"), header = T, stringsAsFactors = F, quote = "")
+eaf_ndufa3_adni <- read.table(paste0(outdir, "/1_5/ndufa3_snps_freq_ADNI.frq"), header = T, stringsAsFactors = F, quote = "")
+maf_ndufa3_meta <- eaf_ndufa3_mcsa %>% left_join(eaf_ndufa3_adni, by=c("CHR", "SNP"), suffix = c("_MCSA", "_ADNI"))
+maf_ndufa3_meta <- maf_ndufa3_meta %>% 
+  mutate(check = case_when(
+           A1_MCSA == A1_ADNI & A2_MCSA == A2_ADNI ~ TRUE,
+           A1_MCSA == A2_ADNI & A2_MCSA == A1_ADNI ~ TRUE,
+           TRUE ~ FALSE # check this for both effect and other alleles
+         )) %>% #all TRUE
+  mutate(MAF_ADNI_aligned = ifelse(A1_MCSA == A1_ADNI, MAF_ADNI, 1-MAF_ADNI)) %>% 
+  # do a sample-size-weighted average MAF
+  mutate(MAF_meta = (MAF_MCSA * NCHROBS_MCSA/2 + MAF_ADNI * NCHROBS_ADNI/2) / (NCHROBS_MCSA/2 + NCHROBS_ADNI/2),
+         MAF_meta_final = pmin(MAF_meta, 1 - MAF_meta))
+all.equal(maf_ndufa3_meta$MAF_meta, maf_ndufa3_meta$MAF_meta_final) #TRUE
+
+
+# prepare coloc input from eQTL
+eqtl_ndufa3_forcoloc <- ndufa3_aligned %>% 
+  left_join(maf_ndufa3_meta %>% dplyr::select(SNP, MAF_meta_final), by=c("SNP_rename" = "SNP")) %>% 
+  filter(check2 != FALSE) %>% 
+  drop_na(hm_beta) %>% 
+  filter(`BETA(R)` != 0) %>% 
+  dplyr::select(`BETA(R)`, varbeta.y, SNP_rename, BP, MAF_meta_final) %>% 
+  rename(beta = `BETA(R)`, varbeta = varbeta.y, snp = SNP_rename, position = BP, MAF = MAF_meta_final) %>% 
+  as.list()
+eqtl_ndufa3_forcoloc$N = 193
+eqtl_ndufa3_forcoloc$type = "quant"
+check_dataset(eqtl_ndufa3_forcoloc)
+
+
+# run coloc
+ndufa3_coloc <- coloc.abf(dataset1=bell_ndufa3_forcoloc, dataset2=eqtl_ndufa3_forcoloc) # "PP abf for shared variant: 5.02%"
+#PP.H0.abf PP.H1.abf PP.H2.abf PP.H3.abf PP.H4.abf 
+ #0.000974  0.690000  0.000365  0.258000  0.050200 
+```
+
+# MR
+
+## Check MR requirements
+
+1)  IVs need to be independent --\> focus on 11 eQTL pairs after clumping
+2)  F-stats \>=10 -- not a strict requirement, but IV with F-stats \< 10 will lead to [weak instrument bias](https://mr-dictionary.mrcieu.ac.uk/term/weak-instrument/).
+
+### Get average F-stats 
+Average F-stats: (sum of beta^2/SE^2)/number of variants. Follow this paper: https://journals.lww.com/hep/fulltext/2025/06000/mendelian_randomization_in_hepatology__a_review_of.25.aspx.
+
+The F-stats are in Supplementary Table 16a
+```{r}
+# plink meta-analysis doesn't produce SE so we manually calculate it.
+# these two formula produce the same results: 
+ ## 1. abs(beta/ qnorm(p/tail)) (tail = 2) (https://www.biostars.org/p/431875/)
+ ## 2. sqrt(((BETA)^2)/qchisq(P,1,lower.tail=F)) (https://groups.google.com/g/plink2-users/c/6g9GM3KcrlI)
+
+clumped_eqtl <- clumped_eqtl %>% 
+  mutate(SE = abs(`BETA(R)` / qnorm(`P(R)`/2)), Var = SE^2, Fstat = `BETA(R)`^2/Var, .after = "BETA(R)") %>% 
+  # change the rsid of two SNPs that are originally NA. The rsid were obtained from dbSNP
+  mutate(rsid = case_when(SNP_rename == "11:78067306:A:G" ~ "rs634768", TRUE ~ rsid)) # when examining SNPs individually, all have Fstat > 10
+
+```
+
+## Run regression between IV and outcome
+```{r run_reg function}
+# a function to run regression analysis with or without covariates
+reg_fn <- function(df_ls, 
+                   responses,
+                   model_type,
+                   include_covariates,
+                   covariates){
+  run_reg <- function(response){
+    if (include_covariates == TRUE){
+        map(names(df_ls), function(SNP){
+          df <- df_ls[[SNP]] # df = dataframe for the called SNP
+          snp <- SNP # snp = called SNP
+          df <- df %>% drop_na(any_of(c(snp, covariates))) # remove any NAs in snp or covariates
+          
+          form <- reformulate(c(snp, covariates), response = response) # formula of the regression
+          
+          if (model_type == "linear"){
+            m <- lm(form, data = df)
+          }
+          else if (model_type == "binomial"){
+            m <- glm(form, data = df, family = "binomial")
+          }
+          
+          tidy(m, conf.int = TRUE) %>% 
+            filter(grepl(snp, term)) %>% 
+            select(rsid = term, estimate, std.error, statistic, p.value, conf.low, conf.high) # final dataframe with relevant statistics
+        }
+      ) %>% 
+        set_names(names(df_ls))
+    }
+  
+    else {
+      map(names(df_ls), function(SNP){
+          df <- df_ls[[SNP]]
+          snp <- SNP
+          df <- df %>% drop_na(any_of(c(snp)))
+          
+          form <- reformulate(c(snp), response = response)
+          
+          if (model_type == "linear"){
+            m <- lm(form, data = df)
+          }
+          else if (model_type == "binomial"){
+            m <- glm(form, data = df, family = "binomial")
+          }
+          
+          tidy(m, conf.int = TRUE) %>% 
+            filter(grepl(snp, term)) %>% 
+            select(rsid = term, estimate, std.error, statistic, p.value, conf.low, conf.high)
+        }
+      ) %>% 
+        set_names(names(df_ls))
+    }
+  }
+  
+  # Run for all combinations
+  results <- expand.grid(
+      Outcomes = responses,
+      stringsAsFactors = F
+  ) %>%
+  mutate(result = pmap(list(Outcomes),
+                      ~ run_reg(..1))) %>%
+  unnest(result)
+  
+  return(results)
+}
+```
+Prepare dataframe and run regression
+```{r IV --> outcome}
+comTrait <- readRDS(paste0(indir, "/comTrait.rds")) # a file having cross-sectional endophenotypes for MCSA (from row 1-105) and ADNI (from row 106-196); row names are donorID
+
+# read in population substructure covariates 
+mcsa_pcs <- read_delim(paste0(indir, "/mcsa_eqtl_covar.txt"), delim = "\t") %>% # a file with WGS IID and population substructure PCs and also ID used in comTrait and other analyses 
+  dplyr::rename(PC1 = EV1, PC2 = EV2, PC3 = EV3) %>% 
+  dplyr::select(IID, ptnum, PC1:PC3) %>% 
+  mutate(SubjectID = as.character(ptnum)) # ptnum = SubjectID
+adni_pcs <- read.table(paste0(indir, "/WGS/ADNI_WGS_CSHR_GBHNFL.pca.evec"), skip = 1, header = F, stringsAsFactors = F)
+colnames(adni_pcs)<- c("IID","PC1", "PC2", "PC3", "PC4", "PC5", "PC6", "PC7", "PC8", "PC9", "PC10", "Dx")
+
+## prepare MCSA phenotype and covariates files 
+mcsa_df <- comTrait[1:105,] %>% 
+  rownames_to_column("SubjectID") %>% 
+  dplyr::select(SubjectID, Memory, LMDR, HippVol) %>% 
+  left_join(mcsa_pcs) %>% 
+  left_join(mcsa_traw %>% dplyr::select(IID, gene_name, SNP, rsid, Dose), by = c("IID")) %>% 
+  drop_na(SNP) %>% 
+  dplyr::select(IID, everything())
+
+
+## prepare ADNI phenotype and covariates files
+adni_df <- comTrait[106:196,] %>% 
+  rownames_to_column("IID") %>% 
+  dplyr::select(IID, Memory, LMDR, HippVol) %>% 
+  left_join(adni_pcs %>% dplyr::select(IID:PC3) %>% mutate(IID = toupper(IID))) %>% 
+  left_join(adni_traw %>% dplyr::select(IID, gene_name, SNP, rsid, Dose), by = c("IID")) %>% 
+  drop_na(SNP) %>% 
+  dplyr::select(IID, everything())
+
+
+mcsa_df_ls <- mcsa_df %>% 
+  named_group_split(rsid) %>% # this creates a list of 11 dataframes, one for each SNP
+  map(~ dplyr::select(.x, -SNP)) %>% 
+  map(~ pivot_wider(.x, names_from = "rsid", values_from = "Dose"))
+mcsa_IV_outcome_PCs <- reg_fn(df_ls = mcsa_df_ls, responses = c("Memory", "LMDR", "HippVol"), model_type = "linear", include_covariates = TRUE, covariates = c("PC1", "PC2", "PC3")) %>% # we adjust for first 3 principal componenets of population substructure
+  unnest(result) %>% 
+  group_by(Outcomes) %>% 
+  mutate(q.value = p.adjust(p.value, "fdr"), .after = "p.value")
+
+
+adni_df_ls <- adni_df %>% 
+  named_group_split(rsid) %>% # this creates a list of 11 dataframes, one for each SNP
+  map(~ dplyr::select(.x, -SNP)) %>% 
+  map(~ pivot_wider(.x, names_from = "rsid", values_from = "Dose"))
+adni_IV_outcome_PCs <- reg_fn(df_ls = adni_df_ls, responses = c("Memory", "LMDR", "HippVol"), model_type = "linear", include_covariates = TRUE, covariates = c("PC1", "PC2", "PC3")) %>% # we adjust for first 3 principal componenets of population substructure
+  unnest(result) %>% 
+  group_by(Outcomes) %>% 
+  mutate(q.value = p.adjust(p.value, "fdr"), .after = "p.value")
+
+# Save those objects to an .RData file
+save(list = ls(pattern = "IV_Outcome"), file = paste0(outdir, "/1_5/IV_Outcome.RData"))
+```
+
+```{r meta-analyze IV-->outcome}
+# prepare input dataframe for meta-analysis
+meta_df_PCs = inner_join(mcsa_IV_outcome_PCs, adni_IV_outcome_PCs, by = c("Outcomes","rsid"), suffix = c("_MCSA", "_ADNI")) %>%
+  mutate(Out_rsid = paste0(Outcomes,"_",rsid)) %>% 
+  column_to_rownames("Out_rsid")
+
+meta_ana_fn <- function(meta_df){
+  # this indicates column indices corresponding to estimates and standard error of MCSA and ADNI
+  eff_idx1 = which(colnames(meta_df) == "estimate_MCSA")
+  eff_idx2 = which(colnames(meta_df) == "estimate_ADNI")
+  err_idx1 = which(colnames(meta_df) == "std.error_MCSA")
+  err_idx2 = which(colnames(meta_df) == "std.error_ADNI")
+  
+  # run meta-analysis using the function meta_gen_fn defined above
+  meta_raw = meta_df %>% pbapply(1, meta_gen_fn, eff_idx1 = eff_idx1, eff_idx2 = eff_idx2, err_idx1 = err_idx1, err_idx2 = err_idx2)
+  
+  # Get all fixed-effect results
+  fix_res = meta_raw %>%
+    pbsapply(function(x) x$fixed) %>%
+    t() %>%
+    as.data.frame() %>%
+    rename_with(~paste0(.x, "_fixed")) %>%
+    rownames_to_column(var = "rn") %>%
+    mutate_all(.funs = ~unlist(.x)) %>% 
+    mutate_all(.funs = ~unname(.x))
+  
+  # Get all random-effect results
+  rand_res = meta_raw %>%
+    pbsapply(function(x) x$random) %>%
+    t() %>%
+    data.frame() %>%
+    rename_with(~paste0(.x, "_random")) %>%
+    rownames_to_column(var = "rn") %>%
+    mutate_all(.funs = ~unlist(.x)) %>%
+    mutate_all(.funs = ~unname(.x))
+  
+  # Get heterogenity meassurments Q, I2, tau2
+  het_res = meta_raw %>%
+    map(~.x[c("Q","df.Q","pval.Q","I2", "lower.I2", "upper.I2", "tau2", "se.tau2", "H", "lower.H", "upper.H")]) %>%
+    bind_rows(.id = "rn")
+  
+  # Join the results to the original regression coeffcients
+  meta_df = meta_df %>%
+    rownames_to_column(var = "rn") %>% 
+    inner_join(fix_res) %>%
+    inner_join(rand_res) %>% 
+    rename_with(~sub("^TE", "beta", .x), everything()) %>%
+    rename_with(~sub("^seTE", "se", .x), everything()) %>%
+    inner_join(het_res, by = "rn")
+  
+  # final meta-analyze dataframe, including adjusting for multiple test correction, determining meta-analyzed beta, p and q-values based on heterogeneity measures I2
+  meta_final = meta_df %>%
+    group_by(Outcomes) %>%
+    mutate(q_random = p.adjust(p_random, method = "fdr"),
+           q_fixed = p.adjust(p_fixed, method = "fdr"),
+           model_meta = ifelse(I2 < 0.25, "Fixed", "Random"),
+           beta_meta = ifelse(model_meta =="Fixed", beta_fixed, beta_random),
+           se_meta = ifelse(model_meta =="Fixed", se_fixed, se_random),
+           p_meta = ifelse(model_meta =="Fixed", p_fixed, p_random),
+           q_meta = ifelse(model_meta =="Fixed", q_fixed, q_random),
+           CI_L_meta = ifelse(model_meta == "Fixed", lower_fixed, lower_random),
+           CI_H_meta = ifelse(model_meta =="Fixed", upper_fixed, upper_random)) %>%
+    dplyr::select(-c(ends_with("_random"), ends_with("_fixed"))) %>% 
+    dplyr::select(-rn)
+}  
+
+meta_IV_outs_PCs <- meta_ana_fn(meta_df_PCs)
+```
+
+# Run MR (TwoSampleMR)
+```{r}
+# prepare dataframe for TwoSampleMR input
+exp_dat <- clumped_eqtl %>% 
+  dplyr::select(rsid, `BETA(R)`, SE, A1, A2, gene_name) %>% 
+  rename(
+    SNP = rsid,
+    exposure = gene_name,
+    beta.exposure = `BETA(R)`,
+    se.exposure = SE,
+    effect_allele.exposure = A1,
+    other_allele.exposure = A2
+  ) %>% 
+  mutate(id.exposure = exposure)
+out_dat_PCs <- meta_IV_outs_PCs %>% 
+  dplyr::select(rsid, Outcomes, beta_meta, se_meta) %>% 
+  left_join(clumped_eqtl %>% dplyr::select(rsid, A1, A2)) %>% 
+  rename(
+    SNP = rsid,
+    outcome = Outcomes,
+    beta.outcome = beta_meta,
+    se.outcome = se_meta,
+    effect_allele.outcome = A1,
+    other_allele.outcome = A2
+  ) %>% 
+  mutate(id.outcome = outcome, mr_keep = TRUE)
+
+mr_in_PCs_split <- exp_dat %>% left_join(out_dat_PCs, by = "SNP")
+# run MR
+mr_PCs_split <- mr(mr_in_PCs_split)
+mr_PCs_split <- mr_PCs_split %>% left_join(mr_in_PCs_split %>% dplyr::select(SNP, outcome, exposure)) 
+mr_PCs_split <- mr_PCs_split %>% dplyr::select(-id.exposure, -id.outcome) %>% relocate(SNP, .before = "outcome")
+write.xlsx(mr_PCs_split, paste0(outdir, "/1_5/TwoSampleMR_WaldRatio.xlsx")) # the organized table is in Supplementary Table 16b
+```
+
+
+
