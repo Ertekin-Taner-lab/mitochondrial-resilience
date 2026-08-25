@@ -1,0 +1,132 @@
+---
+title: "rbt_1_5"
+output: html_document
+date: "2026-08-06"
+---
+
+Author: Wei (Adelyn) Tsai; tsai.wei@mayo.edu
+If you are using this script, please cite our study
+This script addresses comment 5 about cross-platform harmonization from reviewer 1. Please also refer rebuttal/rbt_1_11.R for previous preprocessing.
+
+```{r}
+library(tidyverse) # v2.0.0
+library(patchwork) #v1.3.2
+library(openxlsx) #v4.2.8
+rbt_v1_dir <- "./Rebuttal/outdir" # directory to the results from the first rebuttal
+outdir <- "./Rebuttal_2nd/outdir/1_5"
+
+set.seed(1)
+```
+
+# Calculate PCs after adjustment
+## all genes expression
+```{r}
+comRes_Combat_raw <- readRDS(paste0(rbt_v1_dir, "/1_11/comRes_Combat.rds")) # generated from rebuttal/rbt_1_11.R
+any(is.na(comRes_Combat_raw))
+which(is.na(comRes_Combat_raw), arr.ind = TRUE)
+
+# there're some missing values from the ADNI; replace with median of that gene
+comRes_Combat_expr <- comRes_Combat_raw
+comRes_Combat_expr[106:196, ] <- apply(comRes_Combat_expr[106:196, ], 2, function(x) {
+  x[is.na(x)] <- median(x, na.rm = TRUE)
+  x
+})
+
+# calculate PCs
+pca_res <- prcomp(comRes_Combat_expr, scale = F, center = T)
+
+# variance explained
+summary(pca_res)$importance[2, 1:10]  # PC1-10 proportion of variance
+
+pc_df <- as.data.frame(pca_res$x[, 1:10]) %>%
+  mutate(donor = rownames(pca_res$x), cohort = c(rep("MCSA", 105), rep("ADNI", 91)), .before = "PC1") 
+
+pc_cohort_diff <- pc_df %>%
+  select(starts_with("PC")) %>%
+  imap_dfr(~ {
+    test <- wilcox.test(.x ~ pc_df$cohort)
+    tibble(
+      PC = .y,
+      W = test$statistic,
+      p.value = test$p.value
+    )
+  }) %>%
+  mutate(q.value = p.adjust(p.value, method = "fdr"))
+
+
+```
+
+## only Bl_M3 genes
+```{r}
+consNet_Combat <- readRDS(paste0(rbt_v1_dir, "/1_11/consNet_object_Combat_20251018.rds")) # generated from rebuttal/rbt_1_11.R
+m3_genes <- names(consNet_Combat$consNet$colors)[which(consNet_Combat$consNet$colors == 3)]
+# calculate PCs
+pca_res_M3 <- prcomp(comRes_Combat_expr[,m3_genes], scale = F, center = T)
+
+# variance explained
+summary(pca_res_M3)$importance[2, 1:10]  # PC1-10 proportion of variance
+
+pc_df_M3 <- as.data.frame(pca_res_M3$x[, 1:10]) %>%
+  mutate(donor = rownames(pca_res_M3$x), cohort = c(rep("MCSA", 105), rep("ADNI", 91)), .before = "PC1") 
+
+pc_cohort_diff_M3 <- pc_df_M3 %>%
+  select(starts_with("PC")) %>%
+  imap_dfr(~ {
+    test <- wilcox.test(.x ~ pc_df_M3$cohort)
+    tibble(
+      PC = .y,
+      W = test$statistic,
+      p.value = test$p.value
+    )
+  }) %>%
+  mutate(q.value = p.adjust(p.value, method = "fdr"))
+
+write.xlsx(list("All genes" = pc_cohort_diff, "Bl_M3 genes" = pc_cohort_diff_M3), paste0(outdir,"/PC_Cohort_Diff.xlsx")) # this is in Supplementary Table 8a
+```
+
+
+# Make plot
+```{r}
+var_explained <- summary(pca_res)$importance[2, 1:2] * 100
+pc_df$cohort = factor(pc_df$cohort, levels = c("MCSA", "ADNI"))
+p1 <- ggplot(pc_df, aes(x = PC1, y = PC2, color = cohort)) +
+  geom_point(size = 2.5, alpha = 0.8) +
+  stat_ellipse(level = 0.95, linetype = "dashed") +
+  labs(
+    x = paste0("PC1 (", round(var_explained[1], 1), "% variance)"),
+    y = paste0("PC2 (", round(var_explained[2], 1), "% variance)"),
+    color = "Cohort",
+    title = "Expression PCA of all genes\ncolored by cohort (post-ComBat)"
+  ) +
+  theme_bw(base_size = 7) +
+  theme(
+    panel.grid.minor = element_blank(),
+    legend.position = "right"
+  )
+
+var_explained <- summary(pca_res_M3)$importance[2, 1:2] * 100
+pc_df_M3$cohort = factor(pc_df_M3$cohort, levels = c("MCSA", "ADNI"))
+p2 <- ggplot(pc_df_M3, aes(x = PC1, y = PC2, color = cohort)) +
+  geom_point(size = 2.5, alpha = 0.8) +
+  stat_ellipse(level = 0.95, linetype = "dashed") +
+  labs(
+    x = paste0("PC1 (", round(var_explained[1], 1), "% variance)"),
+    y = paste0("PC2 (", round(var_explained[2], 1), "% variance)"),
+    color = "Cohort",
+    title = "Expression PCA of Bl_M3 genes\ncolored by cohort (post-ComBat)"
+  ) +
+  theme_bw(base_size = 7) +
+  theme(
+    panel.grid.minor = element_blank(),
+    legend.position = "right"
+  )
+
+pdf(paste0(outdir, "/PCA.pdf"), width = 6, height = 3)
+p1 + p2 + plot_layout(guides = "collect") # this is in Extended Data Fig.9a
+dev.off()
+```
+
+```{r}
+sessionInfo()
+```
+

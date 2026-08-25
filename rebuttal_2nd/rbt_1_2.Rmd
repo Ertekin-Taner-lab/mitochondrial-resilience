@@ -1,1 +1,486 @@
+---
+title: "rbt_1_2"
+output: html_document
+date: "2026-07-30"
+---
+
+Author: Wei (Adelyn) Tsai; [tsai.wei\@mayo.edu](mailto:tsai.wei@mayo.edu){.email}.
+
+If you are using this script, please cite our study.
+
+This script addresses comment 2 about cognitive resilience in ROSMAP from reviewer 1.
+
+```{r}
+library(tidyverse) #v2.0.0
+library(broom) #v1.0.12
+library(broom.mixed) #v0.2.9
+library(openxlsx) #v4.2.8
+library(lmerTest) #v3.1
+library(patchwork) #v1.3.2
+
+source("./Codes/fns.R") #source a list of frequently used functions
+
+
+# list of input directories where files are
+indir <- "./indir"
+
+brwgcna_dir <-"./outdir/br_wgcna"
+nduf_assoc_dir <- "./outdir/nduf_assoc_de"
+
+# output directory
+outdir <- "./Rebuttal_2nd/outdir/1_2"
+```
+
+# File preparation
+```{r}
+comTrait_br <- readRDS(paste0(indir, "/comTrait_br.rds")) # a file with organized AMP-AD metadata
+rosmap_id <- read_delim(paste0(indir,"/ROSMAP_id_map.txt"), delim = "\t") %>% mutate(projid = as.character(projid)) # a file mapping between RNAseq SampleID and projid
+
+# Get cognitive scores, global pathology and education from RADC files. 
+radc_cs <- read.xlsx(paste0(indir,"/dataset_886_cross-sectional_11-20-2025.xlsx"))
+radc_long <- read.xlsx(paste0(indir,"/dataset_886_long_11-20-2025.xlsx"))
+
+radc_use <- comTrait_br %>% 
+  filter(Cohort == "ROSMAP") %>% 
+  left_join(rosmap_id, by="SampleID") %>% 
+  dplyr::select(SampleID, projid, everything()) %>% 
+  left_join(radc_cs %>% 
+              dplyr::select(projid, gpath, educ, cognep_demog_slope) %>%  #cognep_demog_slope = episodic memory domain score random slope
+              dplyr::rename(GlobalPath = gpath), by="projid") %>% 
+  left_join(radc_long %>%
+              dplyr::select(projid, cogn_ep, age_at_visit) %>% #cogn_ep = episodic memory domain score
+              group_by(projid) %>%
+              filter(!is.na(cogn_ep)) %>% 
+              slice_tail() # take the latest available cogn_ep; 
+              )
+
+sum(is.na(radc_use$cogn_ep)) # 17 people without cogn_ep
+sum(is.na(radc_use$cognep_demog_slope)) # 36 people without cognep_demog_slope
+
+
+# read in brain module eigengene file
+consMEs_br <- read.csv(paste0(brwgcna_dir , "/MEs1_SP12_Br.csv")) # module eigegenes from consensus brain networks generated in 3_br_wgcna.R
+
+# prepare CQN files
+nduf_bb <- read.csv(paste0(nduf_assoc_dir,"/nduf_bb.csv")) # generated in 4_nduf_assoc_de.R; also in supplementary table 12
+br_cqn2use <- readRDS(paste0(indir, "/br_cqn2use.rds")) # a list containing cqn of brain datasets. In each list is a dataframe where rows are genes and columns are donors
+br_cqn_long_ls <- br_cqn2use %>% map(., ~(pivot_longer(.x, cols = c(4:ncol(.x)), names_to="SampleID", values_to="CQN")))
+cqn_nduf <- br_cqn_long_ls$DLPFC %>% 
+  filter(gene_id %in% nduf_bb$gene_id) %>% 
+  pivot_wider(names_from = "gene_id", values_from = "CQN") %>% 
+  dplyr::select(SampleID, any_of(nduf_bb$gene_id)) %>% 
+  rename_with(
+    ~ nduf_bb$gene_name[match(.x, nduf_bb$gene_id)],
+    .cols = any_of(nduf_bb$gene_id)
+  )
+
+inputdf <- radc_use %>% 
+  left_join(consMEs_br %>% dplyr::select(SubjectID, ME1, ME17, ME26), by = c("SampleID" = "SubjectID")) %>% 
+  left_join(cqn_nduf) %>% 
+  mutate(Batch = factor(Batch, levels=unique(Batch)),
+         Source = factor(Source, levels=unique(Source))
+         )
+
+# center and scale the variables
+standardize_FUN <- function(x) {
+  
+  x_med <- median(x, na.rm = TRUE)
+  x_mad <- mad(x, na.rm = TRUE)
+  x <- ((x - x_med) / x_mad)
+  x
+  
+}
+inputdf_scaled <- inputdf %>% 
+  mutate_at(vars(Braak:GlobalPath), .funs = standardize_FUN) %>% 
+  mutate_at(vars(ME1:NDUFS3), .funs = standardize_FUN)
+```
+
+# Functions for regression
+```{r}
+linear_fn <- function(data_df,
+                     XVars,
+                     XVars2 = NULL, 
+                     YVars, 
+                     base_covs,
+                     random_var,
+                     mode = c("linear", "linear mixed"),
+                     interaction = FALSE){
+  run_assoc <- function(xvar, yvar, xvar2 = NULL){
+    
+    if (interaction){
+      message(xvar, " x ", xvar2, " and ", yvar)
+      main_terms <- paste0(xvar, " * ", xvar2)
+    } else {
+      message(xvar, " and ", yvar)
+      main_terms <- xvar
+    }
+    
+    if (mode == "linear"){
+      m <- lm(paste0(yvar, " ~ ", main_terms, " + ", paste0(base_covs, collapse = " + ")), data = data_df)
+      res_df <- broom::tidy(m, conf.int = T)
+      
+    }
+    else if (mode == "linear mixed"){
+      m <- lmer(paste0(yvar, " ~ ", main_terms, " + ", paste0(base_covs, collapse = " + "), " + ", "(1|", random_var, ")"), data = data_df)
+      res_df <- broom.mixed::tidy(m, conf.int = T)
+    }
+    
+
+    tbl <- tibble(
+      Model = list(m),
+      SummDf = list(res_df)
+    )
+    return(tbl)
+  }
+  
+  # Run for all combinations
+  if (interaction){
+
+    combos <- expand.grid(
+      X = XVars,
+      X2 = XVars2,
+      Y = YVars,
+      stringsAsFactors = FALSE
+    ) %>%
+      filter(X != X2)  # drop X*X pairs
+
+    results <- combos %>%
+      mutate(result = pmap(list(X, Y, X2),
+                            ~ run_assoc(..1, ..2, ..3))) %>%
+      unnest(result)
+
+  } else {
+    results <- expand.grid(
+      X = XVars,
+      Y = YVars,
+      stringsAsFactors = FALSE
+    ) %>%
+      mutate(result = pmap(list(X, Y),
+                            ~ run_assoc(..1, ..2))) %>%
+      unnest(result)
+  }
+  
+  return(results)
+}
+```
+
+
+
+# Run associations
+
+```{r run analyses - after scaling}
+MTModsRes_scaled <- linear_fn(
+  data_df = inputdf_scaled,
+  XVars = c("Braak", "Thal", "CERAD", "GlobalPath"),
+  YVars = c("cogn_ep", "cognep_demog_slope"), # cogn_ep = last episodic memory; cognep_demog_slope = episodic memory slope 
+  XVars2 = c("ME1", "ME17", "ME26"),
+  base_covs = c("AOD", "Sex_M1F0", "educ"),
+  random_var = NULL,
+  mode = "linear",
+  interaction = TRUE
+) 
+MTModsSumm_all_scaled <- MTModsRes_scaled %>% 
+  dplyr::select(X, X2, Y, SummDf) %>% 
+  unnest(SummDf) 
+MTMods_Summ_needed_scaled <- MTModsRes_scaled %>% 
+  dplyr::select(X, X2, Y, SummDf) %>% 
+  unnest(SummDf) %>% 
+  filter(X == term) %>% 
+  group_by(X, Y) %>% # adjusting by the number of modules tested
+  mutate(q.value = p.adjust(p.value, method = "fdr"), .after = "p.value") %>% 
+  bind_rows(
+    MTModsRes_scaled %>% 
+      dplyr::select(X, X2, Y, SummDf) %>% 
+      unnest(SummDf) %>% 
+      filter(X2 == term) %>% 
+      group_by(X, Y) %>% # adjusting by the number of modules tested
+      mutate(q.value = p.adjust(p.value, method = "fdr"), .after = "p.value")
+  ) %>% 
+  bind_rows(
+    MTModsRes_scaled %>% 
+      dplyr::select(X, X2, Y, SummDf) %>% 
+      unnest(SummDf) %>% 
+      filter(grepl(":", term)) %>% 
+      group_by(X, Y) %>% # adjusting by the number of modules tested
+      mutate(q.value = p.adjust(p.value, method = "fdr"), .after = "p.value")
+  ) %>% 
+  arrange(Y, X, X2)
+# after scaling, ME estimates become positive
+
+NDUFRes_scaled <- linear_fn(
+  data_df = inputdf_scaled,
+  XVars = c("Braak", "Thal", "CERAD", "GlobalPath"),
+  YVars = c("cogn_ep", "cognep_demog_slope"),
+  XVars2 = intersect(nduf_bb$gene_name, names(inputdf_scaled)),
+  base_covs = c("AOD", "Sex_M1F0", "RIN", "Source", "educ"),
+  random_var = "Batch",
+  mode = "linear mixed",
+  interaction = TRUE
+)
+NDUFSumm_all_scaled <- NDUFRes_scaled %>% 
+  dplyr::select(X, X2, Y, SummDf) %>% 
+  unnest(SummDf) 
+NDUFSumm_needed_scaled <- NDUFRes_scaled %>% 
+  dplyr::select(X, X2, Y, SummDf) %>% 
+  unnest(SummDf) %>% 
+  filter(X == term) %>% 
+  group_by(X, Y) %>% 
+  mutate(q.value = p.adjust(p.value, method = "fdr"), .after = "p.value") %>% # adjusting by number of genes tested (n=20)
+  dplyr::select(-effect, -group) %>% 
+  bind_rows(
+    NDUFRes_scaled %>% 
+      dplyr::select(X, X2, Y, SummDf) %>% 
+      unnest(SummDf) %>% 
+      filter(X2 == term) %>% 
+      group_by(X, Y) %>% 
+      mutate(q.value = p.adjust(p.value, method = "fdr"), .after = "p.value") %>% # adjusting by number of genes tested (n=20)
+      dplyr::select(-effect, -group)
+  ) %>% 
+  bind_rows(
+    NDUFRes_scaled %>% 
+      dplyr::select(X, X2, Y, SummDf) %>% 
+      unnest(SummDf) %>% 
+      filter(grepl(":", term)) %>% 
+      group_by(X, Y) %>% 
+      mutate(q.value = p.adjust(p.value, method = "fdr"), .after = "p.value") %>% # adjusting by number of genes tested (n=20)
+      dplyr::select(-effect, -group)
+  ) %>% 
+  arrange(Y, X, X2)
+
+# save the summary dataframe
+write.xlsx(
+  list("MTModules_all" = MTModsSumm_all_scaled, 
+       "MTModules_needed" = MTMods_Summ_needed_scaled,
+       "NDUFs_all" = NDUFSumm_all_scaled,
+       "NDUFs_needed" = NDUFSumm_needed_scaled),
+  paste0(outdir, "/ROSMAP_resilience_Association.xlsx"))
+
+# save the results
+save(MTModsRes_scaled, NDUFRes_scaled, file = paste0(outdir, "/results.RData"))
+```
+
+# Plot 
+p1 and p2 are Fig2.c; p3 and p4 are Extended Data Fig.11a
+```{r plot mitochondrial modules results}
+plotdf1 <- MTMods_Summ_needed_scaled %>% 
+  mutate(X2 = str_remove(X2, "E"),
+         X2 = str_c("Br_", X2),
+         X = factor(X, levels = c("Braak", "Thal", "CERAD", "GlobalPath")),
+         Y = ifelse(Y == "cogn_ep", "Last episodic memory", "Episodic memory slope"),
+         Y = factor(Y, levels = c("Last episodic memory", "Episodic memory slope")),
+         lbl = if_else(q.value<0.05, "\u2731", ""), 
+         lbl = if_else(p.value<0.05 & q.value>0.05,"Δ", lbl))
+
+
+p1 <- plotdf1 %>% 
+  filter(grepl("^ME", term) & X != "CERAD" & Y == "Last episodic memory") %>% 
+  ggplot(aes(x = X, y = X2)) +
+  geom_point(shape=21, color="black", aes(fill=estimate, size = -log(p.value))) +
+  geom_text(aes(label=lbl), size=5/.pt, family = "Arial") +
+  scale_fill_gradient2(low = "blue", high = "red", mid = "white", midpoint = 0, name=expression(beta))+
+  scale_y_discrete(limits = rev) +
+  #scale_size_continuous(range = c(2,10)) + 
+  labs(
+    title = "Association with\nlast episodic memory",
+    y = "Brain mitochondrial consensus module",
+    x = "Adjusted pathology",
+    caption = "Δ:P<0.05\n\u2731:q<0.05") +
+  guides(size = guide_legend(order = 1)) +
+  theme_minimal(base_size = 6.5) +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1),
+        strip.background = element_rect(colour = "black"),
+        legend.key.size = unit(0.1,"in"),
+        plot.title = element_text(hjust = 0.5))
+p2 <- plotdf1 %>% 
+  filter(grepl("^ME", term) & X != "CERAD" & Y == "Episodic memory slope") %>% 
+  ggplot(aes(x = X, y = X2)) +
+  geom_point(shape=21, color="black", aes(fill=estimate, size = -log(p.value))) +
+  geom_text(aes(label=lbl), size=5/.pt, family = "Arial") +
+  scale_fill_gradient2(low = "blue", high = "red", mid = "white", midpoint = 0, name=expression(beta))+
+  scale_y_discrete(limits = rev) +
+  #scale_size_continuous(range = c(2,10)) + 
+  labs(
+    title = "Association with\nepisodic memory slope",
+    y = "Brain mitochondrial consensus module",
+    x = "Adjusted pathology",
+    caption = "Δ:P<0.05\n\u2731:q<0.05") +
+  guides(size = guide_legend(order = 1)) +
+  theme_minimal(base_size = 6.5) +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1),
+        strip.background = element_rect(colour = "black"),
+        legend.key.size = unit(0.1,"in"),
+        plot.title = element_text(hjust = 0.5))
+p3 <- plotdf1 %>% 
+  filter(grepl(":", term) & X != "CERAD" & Y == "Last episodic memory") %>% 
+  ggplot(aes(x = X, y = X2)) +
+  geom_point(shape=21, color="black", aes(fill=estimate, size = -log(p.value))) +
+  geom_text(aes(label=lbl), size=5/.pt, family = "Arial") +
+  scale_fill_gradient2(low = "blue", high = "red", mid = "white", midpoint = 0, name=expression(beta))+
+  scale_y_discrete(limits = rev) +
+  #scale_size_continuous(range = c(2,10)) + 
+  labs(
+    title = "Association with\nlast episodic memory",
+    subtitle = "Effect of interaction term\n(Br_ME x pathology)",
+    y = "Brain mitochondrial consensus module",
+    x = "Adjusted pathology",
+    caption = "Δ:P<0.05\n\u2731:q<0.05") +
+  guides(size = guide_legend(order = 1)) +
+  theme_minimal(base_size = 6.5) +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1),
+        strip.background = element_rect(colour = "black"),
+        legend.key.size = unit(0.1,"in"),
+        plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5))
+p4 <- plotdf1 %>% 
+  filter(grepl(":", term) & X != "CERAD" & Y == "Episodic memory slope") %>% 
+  ggplot(aes(x = X, y = X2)) +
+  geom_point(shape=21, color="black", aes(fill=estimate, size = -log(p.value))) +
+  geom_text(aes(label=lbl), size=5/.pt, family = "Arial") +
+  scale_fill_gradient2(low = "blue", high = "red", mid = "white", midpoint = 0, name=expression(beta))+
+  scale_y_discrete(limits = rev) +
+  #scale_size_continuous(range = c(2,10)) + 
+  labs(
+    title = "Association with\nepisodic memory slope",
+    subtitle = "Effect of interaction term\n(Br_ME x pathology)",
+    y = "Brain mitochondrial consensus module",
+    x = "Adjusted pathology",
+    caption = "Δ:P<0.05\n\u2731:q<0.05") +
+  guides(size = guide_legend(order = 1)) +
+  theme_minimal(base_size = 6.5) +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1),
+        strip.background = element_rect(colour = "black"),
+        legend.key.size = unit(0.1,"in"),
+        plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5))
+
+cairo_pdf(paste0(outdir, "/MTModsCRCDR_hm_noCERAD.pdf"), width = 4, height = 5)
+(p1+p2)/(p3+p4)
+dev.off() 
+
+
+```
+
+p1 and p2 are Fig.4b; p3 and p4 are Extended Data Fig.11b
+```{r plot NDUFs results}
+
+plotdf2 <- NDUFSumm_needed_scaled %>% 
+  mutate(X2 = str_remove(X2, "E"),
+         X = factor(X, levels = c("Braak", "Thal", "CERAD", "GlobalPath")),
+         Y = ifelse(Y == "cogn_ep", "Last episodic memory", "Episodic memory slope"),
+         Y = factor(Y, levels = c("Last episodic memory", "Episodic memory slope")),
+         lbl = if_else(q.value<0.05, "\u2731", ""), 
+         lbl = if_else(p.value<0.05 & q.value>0.05,"Δ", lbl))
+
+p1 <- plotdf2 %>% 
+  filter(grepl("^NDUF", term) & X != "CERAD" & Y == "Last episodic memory") %>% 
+  ggplot(aes(x = X, y = X2)) +
+  geom_point(shape=21, color="black", aes(fill=estimate, size = -log(p.value))) +
+  geom_text(aes(label=lbl), size=5/.pt, family = "Arial") +
+  scale_fill_gradient2(low = "blue", high = "red", mid = "white", midpoint = 0, name=expression(beta))+
+  #scale_size_continuous(range = c(2,10)) + 
+  labs(
+    title = "Association with\nlast episodic memory",
+    y = "",
+    x = "Adjusted pathology",
+    caption = "Δ:P<0.05\n\u2731:q<0.05") +
+  guides(size = guide_legend(order = 1)) +
+  theme_minimal(base_size = 6.5) +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1),
+        axis.text.y = element_text(face = "italic"),
+        strip.background = element_rect(colour = "black"),
+        legend.key.size = unit(0.1,"in"),
+        plot.title = element_text(hjust = 0.5))
+p2 <- plotdf2 %>% 
+  filter(grepl("^NDUF", term) & X != "CERAD" & Y == "Episodic memory slope") %>% 
+  ggplot(aes(x = X, y = X2)) +
+  geom_point(shape=21, color="black", aes(fill=estimate, size = -log(p.value))) +
+  geom_text(aes(label=lbl), size=5/.pt, family = "Arial") +
+  scale_fill_gradient2(low = "blue", high = "red", mid = "white", midpoint = 0, name=expression(beta))+
+  #scale_size_continuous(range = c(2,10)) + 
+  labs(
+    title = "Association with\nepisodic memory slope",
+    y = "",
+    x = "Adjusted pathology",
+    caption = "Δ:P<0.05\n\u2731:q<0.05") +
+  #facet_grid(.~ type) +
+  guides(size = guide_legend(order = 1)) +
+  theme_minimal(base_size = 6.5) +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1),
+        axis.text.y = element_text(face = "italic"),
+        strip.background = element_rect(colour = "black"),
+        legend.key.size = unit(0.1,"in"),
+        plot.title = element_text(hjust = 0.5))
+p3 <- plotdf2 %>% 
+  filter(grepl(":", term) & X != "CERAD" & Y == "Last episodic memory") %>% 
+  ggplot(aes(x = X, y = X2)) +
+  geom_point(shape=21, color="black", aes(fill=estimate, size = -log(p.value))) +
+  geom_text(aes(label=lbl), size=5/.pt, family = "Arial") +
+  scale_fill_gradient2(low = "blue", high = "red", mid = "white", midpoint = 0, name=expression(beta))+
+  #scale_size_continuous(range = c(2,10)) + 
+  labs(
+    title = "Association with\nlast episodic memory",
+    subtitle = "Effect of interaction term\n(NDUF x pathology)",
+    y = "",
+    x = "Adjusted pathology",
+    caption = "Δ:P<0.05\n\u2731:q<0.05") +
+  guides(size = guide_legend(order = 1)) +
+  theme_minimal(base_size = 6.5) +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1),
+        axis.text.y = element_text(face = "italic"),
+        strip.background = element_rect(colour = "black"),
+        legend.key.size = unit(0.1,"in"),
+        plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5))
+p4 <- plotdf2 %>% 
+  filter(grepl(":", term) & X != "CERAD" & Y == "Episodic memory slope") %>% 
+  ggplot(aes(x = X, y = X2)) +
+  geom_point(shape=21, color="black", aes(fill=estimate, size = -log(p.value))) +
+  geom_text(aes(label=lbl), size=5/.pt, family = "Arial") +
+  scale_fill_gradient2(low = "blue", high = "red", mid = "white", midpoint = 0, name=expression(beta))+
+  #scale_size_continuous(range = c(2,10)) + 
+  labs(
+    title = "Association with\nepisodic memory slope",
+    subtitle = "Effect of interaction term\n(NDUF x pathology)",
+    y = "",
+    x = "Adjusted pathology",
+    caption = "Δ:P<0.05\n\u2731:q<0.05") +
+  guides(size = guide_legend(order = 1)) +
+  theme_minimal(base_size = 6.5) +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1),
+        axis.text.y = element_text(face = "italic"),
+        strip.background = element_rect(colour = "black"),
+        legend.key.size = unit(0.1,"in"),
+        plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5))
+
+cairo_pdf(paste0(outdir, "/NDUFsCRCDR_hm_noCERAD.pdf"), width = 4.5, height = 10)
+(p1 + p2)/(p3 + p4)
+dev.off()
+```
+
+
+This example plot is in second rebuttal document in Rebuttal Fig.1c
+```{r visual example plot}
+model = MTModsRes_scaled$Model[[9]]
+tertiles <- quantile(inputdf_scaled$ME26, probs = c(0, 0.5, 1))
+p1 <- sjPlot::plot_model(model,
+             type = "pred",
+             terms = c("Braak", paste0("ME26 [", paste(round(tertiles, 2), collapse = ","), "]"))) +
+    scale_colour_brewer(palette = "Set1", aesthetics = c('colour', 'fill'),
+                        labels = c("Minimum", "Medium (50%)", "Maximum")
+                        )  +
+    sjPlot::theme_sjplot() +
+    labs(title = "Effect of Br_M26 expression on the\nrelationship between episodic memory & Braak",
+         y = "last episodic memory",
+         color = "Br_M26") 
+
+pdf(paste0(outdir, "/visual_ex.pdf"), width = 6, height = 6)
+p1
+dev.off()
+```
+
+
+```{r}
+sessionInfo()
+```
 

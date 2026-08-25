@@ -1,0 +1,521 @@
+---
+title: "rbt_1_3"
+output: html_document
+date: "2026-07-31"
+---
+Author: Wei (Adelyn) Tsai; [tsai.wei\@mayo.edu](mailto:tsai.wei@mayo.edu){.email}.
+
+If you are using this script, please cite our study.
+
+This script addresses comment 3 about regional specificity from reviewer 1.
+
+```{r}
+library(tidyverse) #v2.0.0
+library(broom) #v1.0.12
+library(broom.mixed) #v0.2.9
+library(openxlsx) #v4.2.8
+library(lmerTest) #v3.1
+library(emmeans) #v2.0.3
+library(car) #v.3.1-5
+library(patchwork) #v1.3.2
+
+source("./Codes/fns.R") #source a list of frequently used functions
+
+
+# list of input directories where files are
+indir <- "./indir"
+
+brwgcna_dir <-"./outdir/br_wgcna"
+nduf_assoc_dir <- "./outdir/nduf_assoc_de"
+
+# output directory
+outdir <- "./Rebuttal_2nd/outdir/1_3"
+```
+
+# File preparation
+```{r}
+comTrait_br <- readRDS(paste0(indir, "/comTrait_br.rds")) # a file with organized AMP-AD metadata
+
+# we need to identify the donor ID associated with the sample ID
+## sample ID refers to unique ID for each tissue. A donor could have multiple sample ID
+mssm_biospec <- read.csv(paste0(indir, "/MSBB_biospecimen_metadata.csv")) # this is the biospecimen data on synapse (syn21893059)
+mssm_biospec <- mssm_biospec %>% filter(assay == "rnaSeq")
+
+# read in brain module eigengene file
+consMEs_br <- read.csv(paste0(brwgcna_dir , "/MEs1_SP12_Br.csv")) # module eigegenes from consensus brain networks generated in 3_br_wgcna.R
+
+# prepare demographic file for Mayo and MSSM
+mayo <- comTrait_br %>% filter(Cohort == "Mayo") %>% mutate(DonorID = as.character(gsub("_.*", "", SampleID)), .after = "SampleID") # 173 unique donors
+mssm <- comTrait_br %>% filter(Cohort == "MSSM") %>% 
+  left_join(mssm_biospec %>% dplyr::select(individualID, specimenID), by = c("SampleID" = "specimenID")) %>% 
+  rename(DonorID = individualID) %>% 
+  relocate(DonorID, .after = "SampleID") # 152 unique donors
+
+# prepare CQN files
+nduf_bb <- read.csv(paste0(nduf_assoc_dir,"/nduf_bb.csv")) # generated in 4_nduf_assoc_de.R; also in supplementary table 12
+br_cqn2use <- readRDS(paste0(indir, "/br_cqn2use.rds")) # a list containing cqn of brain datasets. In each list is a dataframe where rows are genes and columns are donors
+br_cqn_long_ls <- br_cqn2use %>% map(., ~(pivot_longer(.x, cols = c(4:ncol(.x)), names_to="SampleID", values_to="CQN")))
+cqn_nduf <- br_cqn_long_ls %>% 
+  bind_rows() %>% 
+  filter(gene_id %in% nduf_bb$gene_id) %>% 
+  pivot_wider(names_from = "gene_id", values_from = "CQN") %>% 
+  dplyr::select(SampleID, any_of(nduf_bb$gene_id)) %>% 
+  rename_with(
+    ~ nduf_bb$gene_name[match(.x, nduf_bb$gene_id)],
+    .cols = any_of(nduf_bb$gene_id)
+  )
+inputdf_mayo <- mayo %>% 
+  mutate(Batch = factor(Batch),
+         Source = factor(Source),
+         Region = as.character(Region),
+         Region = ifelse(Region == "Mayo\nSTG", "STG", Region),
+         Region = factor(Region, levels = c("STG", "CER")), # STG set as reference for ease of interpretation/visualization
+         DX = factor(DX, levels = c("AD", "Control"))
+         ) %>%
+  left_join(consMEs_br %>% dplyr::select(SubjectID, ME1, ME17, ME26), by = c("SampleID" = "SubjectID")) %>% 
+  left_join(cqn_nduf)
+
+# set to contr.sum is needed to have meaningful interpretation for the main effect in type 3 ANOVA
+region_levels <- levels(factor(inputdf_mayo$Region))
+sum_contr <- contr.sum(length(region_levels))
+rownames(sum_contr) <- region_levels
+colnames(sum_contr) <- region_levels[-length(region_levels)]  # readable names instead of "1", "2", ...
+contrasts(inputdf_mayo$Region) <- sum_contr
+
+dx_levels <- levels(factor(inputdf_mayo$DX))
+sum_contr <- contr.sum(length(dx_levels))
+rownames(sum_contr) <- dx_levels
+colnames(sum_contr) <- dx_levels[-length(dx_levels)]  # readable names instead of "1", "2", ...
+contrasts(inputdf_mayo$DX) <- sum_contr
+
+inputdf_mssm <- mssm %>% 
+  mutate(Batch = factor(Batch),
+         Region = as.character(Region),
+         Region = ifelse(Region == "MSSM\nSTG", "STG", Region),
+         Region = factor(Region, levels = c("PHG", "STG", "IFG", "FP")), # PHG set as reference for east of interpretation/visualization
+         DX = factor(DX, levels = c("AD", "Control"))
+         ) %>% 
+  left_join(consMEs_br %>% dplyr::select(SubjectID, ME1, ME17, ME26), by = c("SampleID" = "SubjectID")) %>% 
+  left_join(cqn_nduf)
+
+region_levels <- levels(factor(inputdf_mssm$Region))
+sum_contr <- contr.sum(length(region_levels))
+rownames(sum_contr) <- region_levels
+colnames(sum_contr) <- region_levels[-length(region_levels)]  # readable names instead of "1", "2", ...
+contrasts(inputdf_mssm$Region) <- sum_contr
+
+dx_levels <- levels(factor(inputdf_mssm$DX))
+sum_contr <- contr.sum(length(dx_levels))
+rownames(sum_contr) <- dx_levels
+colnames(sum_contr) <- dx_levels[-length(dx_levels)]  # readable names instead of "1", "2", ...
+contrasts(inputdf_mssm$DX) <- sum_contr
+
+# check the structure of batch and donor
+inputdf_mayo %>% group_by(Region, Batch) %>% summarise(n= n()) %>% print(n=30) # two regions, each region has different batch (i.e. no duplicated batch b/w regions), each batch has 2-14 donors
+inputdf_mayo %>% count(DonorID, Batch) %>% count(DonorID) %>% filter(n > 1) # 119 out of 173 have two unique batches
+
+inputdf_mssm %>% group_by(Region, Batch) %>% summarise(n= n()) %>% arrange(Batch) %>% print(n=36)  # four regions, there're duplicated batches between regions
+inputdf_mssm %>% count(DonorID, Batch) %>% count(DonorID) %>% filter(n > 1) # 126 out of 152 have at least two unique batches
+```
+
+# Functions for regression
+
+```{r}
+linear_fn_complex <- function(data_df,
+                       XVars,
+                       XVars2 = NULL, 
+                       YVars, 
+                       base_covs,
+                       random_var1,
+                       random_var2 = NULL,
+                       mode = c("linear", "linear mixed", "linear mixed nested", "linear mixed crossed"),
+                       interaction = FALSE,
+                       region_contrasts = FALSE,
+                       plot_emmip = FALSE,
+                       within_model_adjust = "none"){ 
+  
+  run_assoc <- function(xvar, yvar, xvar2 = NULL){
+    
+    # ---- 1. CONTSRUCT MODELS ----
+    if (interaction){
+      message(xvar, " x ", xvar2, " and ", yvar)
+      main_terms <- paste0(xvar, " * ", xvar2)
+    } else {
+      message(xvar, " and ", yvar)
+      main_terms <- xvar
+    }
+    
+    covs <- paste(base_covs, collapse = " + ")
+    
+    random_term <- switch(mode,
+      "linear" = "",
+      "linear mixed" = paste0("(1|", random_var1, ")"),
+      "linear mixed nested" = paste0("(1|", random_var1, "/", random_var2, ")"),
+      "linear mixed crossed" = paste0("(1|", random_var1, ") + (1|", random_var2, ")")
+    )
+    
+    formula_str <- paste0(yvar, "~", main_terms, "+", covs,
+                          if (random_term != "") paste("+", random_term))
+    
+    if (mode == "linear"){
+      m <- lm(formula_str, data = data_df)
+      res_df <- broom::tidy(m, conf.int = TRUE)
+    } else {
+      m <- lmer(formula_str, data = data_df)
+      res_df <- broom.mixed::tidy(m, conf.int = TRUE)
+    }
+    
+    # ---- 2. SET UP FOR INTERACTION TERMS COMPARISON ----
+    anova_df <- NULL
+    region_simple_df <- NULL
+    region_pairwise_df <- NULL
+    emmip_plot <- NULL
+    
+    if (interaction && region_contrasts){
+      
+      # DETERMINE THE NUMBER OF LEVELS FOR XVAR2
+      # SKIP ANOVA IF THERE'RE ONLY TWO LEVELS
+      n_levels_xvar2 <- length(unique(na.omit(data_df[[xvar2]])))
+
+      if (n_levels_xvar2 == 2){
+        anova_df <- res_df %>%
+          filter(grepl(":", term)) %>%
+          mutate(note = "2-level xvar2") # THIS IS WHAT WE REPORT FOR MAYO IN THE MANUSCRIPT SUPPLEMENTARY TABLE 10A
+        
+      } else {
+        # ANOVA TO SEE IF THERE'S OVERALL DIFFERENCE IN INTERACTION TERM
+        anova_df <- 
+          car::Anova(m, type = 3) %>%
+            broom::tidy() %>%
+            filter(grepl(":", term)) # THIS IS WHAT WE REPORT FOR MSSM IN THE MANUSCRIPT SUPPLEMENTARY TABLE 10A
+      }
+      
+      is_continuous <- is.numeric(data_df[[xvar]])
+      
+      if (is_continuous){
+        # SIMPLE PER-REGION TRENDS. NO INTERNAL COMPARISON HAPPENING.
+        # ASK WHICH REGIONS SHOW SIGNIFICANT PATHOLOGY-EXPRESSION ASSOCIATION.
+        region_simple_df <- 
+          emtrends(m, specs = xvar2, var = xvar) %>%
+            broom::tidy(conf.int = TRUE)
+        
+        # PAIRWISE REGION COMPARISON. DEFAULT IS TUKEY.
+        # FOR TWO-LEVELS XVAR2, ABSOLUTE ESTIMATE WILL BE THE SAME AS LMER TEST BUT P-VALUE SLIGHTLY DIFFERENT.
+        # STILL CALCULATE PAIRWISE_DF FOR TWO-LEVELS XVAR2 TO KEEP CONSISTENT WITH THE CALCULATING METHODS OF THE REPORTING P-VALUE 
+        region_pairwise_df <- 
+          emtrends(m, specs = as.formula(paste0("pairwise ~ ", xvar2)), var = xvar, adjust = within_model_adjust)$contrasts %>%
+            broom::tidy(conf.int = TRUE)
+      } else {
+        # SIMPLE DX EFFECT WITHIN REGION. NO INTERNAL COMPARISON.
+        # ASK WHICH REGIONS SHOW SIGNIFICANT DX-EXPRESSION ASSOCIATION.
+        region_simple_df <- 
+          emmeans(m, specs = as.formula(paste0("~ ", xvar, " | ", xvar2))) %>%
+            contrast("revpairwise") %>%
+            broom::tidy(conf.int = TRUE)
+        
+        # PAIRWISE REGION COMPARISON. TUKEY BY DEFAULT
+        # SET ADJUST TO NONE SO WE CAN LATER ADJUST BY FDR OURSELVES
+        region_pairwise_df <- 
+          emmeans(m, specs = as.formula(paste0("~ ", xvar, " | ", xvar2))) %>%
+            contrast("revpairwise") %>%
+            contrast("pairwise", by = NULL, adjust = "none") %>%
+            broom::tidy(conf.int = TRUE)
+      }
+      # ---- 3. GENERATE INTERACTION PLOT ----
+      if (plot_emmip){
+        emmip_plot <- 
+          if (is_continuous){
+            # continuous X: emmip needs at = list() for the trend variable across a range,
+            # or plot predicted values across xvar2 levels faceted by xvar-derived groups
+            emmip(m, as.formula(paste0(xvar2, " ~ ", xvar)),
+                            CIs = TRUE,
+                            at = setNames(list(range(data_df[[xvar]], na.rm = TRUE)), xvar)) +
+              labs(title = paste0(yvar, ": ", xvar, " x ", xvar2),
+                   y = paste0("Predicted ", yvar)) +
+              theme(plot.title = element_text(size = 14))
+          } else {
+            emmip(m, as.formula(paste0(xvar, " ~ ", xvar2)), CIs = TRUE) +
+             labs(title = paste0(yvar, ": ", xvar, " x ", xvar2),
+                  y = paste0("Predicted ", yvar)) +
+              theme(plot.title = element_text(size = 14))
+          }
+      }
+    }
+    # ---- 4. SAVE RESULTS ----
+    tibble(
+      Model = list(m),
+      SummDf = list(res_df),
+      ANOVA = list(anova_df),
+      RegionSimple = list(region_simple_df),
+      RegionPairwise = list(region_pairwise_df),
+      Plot = list(emmip_plot)
+    )
+  }
+  # ---- 5. RUN THROUGH ALL COMBINATIONS ----
+  if (interaction){
+    combos <- expand.grid(
+      X = XVars,
+      X2 = XVars2,
+      Y = YVars,
+      stringsAsFactors = FALSE
+    ) %>%
+      filter(X != X2)
+    results <- combos %>%
+      mutate(result = pmap(list(X, Y, X2),
+                            ~ run_assoc(..1, ..2, ..3))) %>%
+      unnest(result)
+  } else {
+    results <- expand.grid(
+      X = XVars,
+      Y = YVars,
+      stringsAsFactors = FALSE
+    ) %>%
+      mutate(result = pmap(list(X, Y),
+                            ~ run_assoc(..1, ..2))) %>%
+      unnest(result)
+  }
+  
+  return(results)
+}
+```
+
+
+# Run associations
+
+```{r run analyses}
+MTModsRes_mayo <- linear_fn_complex(
+  data_df = inputdf_mayo,
+  XVars = c("DX", "Braak", "Thal"),
+  YVars = c("ME1", "ME17", "ME26"),
+  XVars2 = "Region",
+  base_covs = c("AOD", "Sex_M1F0"),
+  random_var1 = "DonorID",
+  mode = "linear mixed",
+  interaction = TRUE,
+  region_contrasts = TRUE,
+  plot_emmip = TRUE,
+  within_model_adjust = "none"
+) 
+MTModsRes_mayo <- MTModsRes_mayo %>% 
+  group_by(X) %>% 
+  mutate(interaction_p = map_dbl(ANOVA, ~.x$p.value[1]), # no significant from interaction term
+         interaction_padj = p.adjust(interaction_p, method = "fdr")) %>%  # adjusted by number of tested modules (n=3)
+  ungroup()
+MTMods_anova_mayo <- MTModsRes_mayo %>% 
+  dplyr::select(X, Y, ANOVA) %>% 
+  unnest(ANOVA) %>% 
+  group_by(X) %>% 
+  mutate(q.value = p.adjust(p.value, method = "fdr")) # adjusted by number of tested modules (n=3)
+# we found no significant results from ANOVA for Mayo, indicating that the difference in mito module expression b/w controls and AD are similarly large b/w STG and CER
+
+MTModsRes_mssm <- linear_fn_complex(
+  data_df = inputdf_mssm,
+  XVars = c("DX", "Braak", "CERAD"),
+  YVars = c("ME1", "ME17", "ME26"),
+  XVars2 = "Region",
+  base_covs = c("AOD", "Sex_M1F0"),
+  random_var1 = "DonorID",
+  mode = "linear mixed",
+  interaction = TRUE,
+  region_contrasts = TRUE,
+  plot_emmip = TRUE,
+  within_model_adjust = "none"
+) 
+MTModsRes_mssm <- MTModsRes_mssm %>% 
+  group_by(X) %>% 
+  mutate(interaction_p = map_dbl(ANOVA, ~.x$p.value[1]),
+         interaction_padj = p.adjust(interaction_p, method = "fdr")) %>%  # adjusted by number of tested modules (n=3); all except for Braak ME26 remain significant
+  ungroup()
+MTMods_anova_mssm <- MTModsRes_mssm %>% 
+  dplyr::select(X, Y, ANOVA) %>% 
+  unnest(ANOVA) %>% 
+  group_by(X) %>% 
+  mutate(q.value = p.adjust(p.value, method = "fdr")) # adjusted by number of tested modules (n=3)
+MTMods_pairwise_mssm <- MTModsRes_mssm %>%
+  filter(interaction_padj < 0.05) %>% 
+  dplyr::select(X, Y, RegionPairwise) %>%
+  unnest(RegionPairwise, keep_empty = TRUE) %>% 
+  group_by(X) %>% 
+  mutate(q.value = p.adjust(p.value, method = "fdr"))  %>% # adjusted by number of modules passed anova q<0.05 * number of pairwise contrast
+  ungroup()
+
+NDUFRes_mayo_dx <- linear_fn_complex(
+  data_df = inputdf_mayo,
+  XVars = c("DX"),
+  YVars = intersect(nduf_bb$gene_name, names(inputdf_mayo)),
+  XVars2 = "Region", 
+  base_covs = c("AOD", "Sex_M1F0", "RIN", "Source"),
+  random_var1 = "Batch",
+  random_var2 = "DonorID",
+  mode = "linear mixed crossed",
+  interaction = TRUE,
+  region_contrasts = TRUE,
+  plot_emmip = TRUE,
+  within_model_adjust = "none"
+)
+NDUFRes_mayo_path <- linear_fn_complex(
+  data_df = inputdf_mayo,
+  XVars = c("Braak", "Thal"),
+  YVars = intersect(nduf_bb$gene_name, names(inputdf_mayo)),
+  XVars2 = "Region", 
+  base_covs = c("AOD", "Sex_M1F0", "RIN"),
+  random_var1 = "Batch",
+  random_var2 = "DonorID",
+  mode = "linear mixed crossed",
+  interaction = TRUE,
+  region_contrasts = TRUE,
+  plot_emmip = TRUE,
+  within_model_adjust = "none"
+)
+NDUFRes_mayo <- bind_rows(NDUFRes_mayo_dx, NDUFRes_mayo_path) %>% 
+  group_by(X) %>% 
+  mutate(interaction_p = map_dbl(ANOVA, ~.x$p.value[1]), 
+         interaction_padj = p.adjust(interaction_p, method = "fdr")) %>%  # adjusted by number of tested genes (n=20)
+  ungroup()
+NDUFRes_anova_mayo <- NDUFRes_mayo %>% 
+  dplyr::select(X, Y, ANOVA) %>% 
+  unnest(ANOVA) %>% 
+  group_by(X) %>% 
+  mutate(q.value = p.adjust(p.value, method = "fdr"))
+NDUFRes_pairwise_mayo <- NDUFRes_mayo %>%
+  filter(interaction_padj < 0.05) %>% 
+  dplyr::select(X, Y, RegionPairwise) %>%
+  unnest(RegionPairwise, keep_empty = TRUE)  %>% 
+  group_by(X) %>% 
+  mutate(q.value = p.adjust(p.value, method = "fdr")) %>%  # adjusted by number of modules passed anova q<0.05 * number of pairwise contrast
+  ungroup()
+
+NDUFRes_mssm <- linear_fn_complex(
+  data_df = inputdf_mssm,
+  XVars = c("DX", "Braak", "CERAD"),
+  YVars = intersect(nduf_bb$gene_name, names(inputdf_mssm)),
+  XVars2 = "Region", 
+  base_covs = c("AOD", "Sex_M1F0", "RIN"),
+  random_var1 = "Batch",
+  random_var2 = "DonorID",
+  mode = "linear mixed crossed",
+  interaction = TRUE,
+  region_contrasts = TRUE,
+  plot_emmip = TRUE,
+  within_model_adjust = "none"
+)
+NDUFRes_mssm <- NDUFRes_mssm %>% 
+  group_by(X) %>% 
+  mutate(interaction_p = map_dbl(ANOVA, ~.x$p.value[1]), 
+         interaction_padj = p.adjust(interaction_p, method = "fdr")) %>%  # adjusted by number of tested genes (n=20)
+  ungroup()
+NDUFRes_anova_mssm <- NDUFRes_mssm %>% 
+  dplyr::select(X, Y, ANOVA) %>% 
+  unnest(ANOVA) %>% 
+  group_by(X) %>% 
+  mutate(q.value = p.adjust(p.value, method = "fdr"))
+NDUFRes_pairwise_mssm <- NDUFRes_mssm %>%
+  filter(interaction_padj < 0.05) %>% 
+  dplyr::select(X, Y, RegionPairwise) %>%
+  unnest(RegionPairwise, keep_empty = TRUE)  %>% 
+  group_by(X) %>% 
+  mutate(q.value = p.adjust(p.value, method = "fdr")) %>% # adjusted by number of modules passed anova q<0.05 * number of pairwise contrast
+  ungroup()
+
+# save the resulting objects
+save(MTModsRes_mayo, MTModsRes_mssm, NDUFRes_mayo, NDUFRes_mssm, file = paste0(outdir, "/results.RData"))
+
+# save the summary dataframe
+write.xlsx(
+  list("MTModules_anova_mayo" = MTMods_anova_mayo, 
+       "MTModules_anova_mssm" = MTMods_anova_mssm,
+       "MTModules_pairwise_mssm" = MTMods_pairwise_mssm,
+       "NDUFs_anova_mayo" = NDUFRes_anova_mayo,
+       "NDUFs_pairwise_mayo" = NDUFRes_pairwise_mayo,
+       "NDUFs_anova_mssm" = NDUFRes_anova_mssm,
+       "NDUFs_pairwise_mssm" = NDUFRes_pairwise_mssm),
+  paste0(outdir, "/anova_pairwise.xlsx")) # the organized tables from these results are in Supplementary Table 10a & c
+```
+
+# Plot
+These are in Extended Data Fig.10
+```{r}
+# generate plot of contrast for MT Modules MSSM----
+cairo_pdf(paste0(outdir, "/MSSM_MTMods_contrast.pdf"), width = 5, height = 2)
+MTMods_pairwise_mssm %>% 
+  mutate(contrast = ifelse(grepl("Control", contrast), gsub("\\(Control - AD |\\)", "", contrast), contrast),
+         X = ifelse(X == "DX", "Control-AD", X),
+         X = factor(X, levels = c("Control-AD", "CERAD", "Braak")),
+         Y = str_remove(Y, "E"),
+         Y = paste0("Br_", Y),
+         lbl = if_else(p.value<0.05, "△", ""),
+         lbl=if_else(q.value<0.05, "✱", lbl)) %>% 
+  complete(X, Y, contrast, fill = list(estimate = NA_real_, p.value = NA_real_)) %>% 
+  ggplot(aes(x = contrast, y = Y)) +
+  geom_tile(aes(fill = estimate), color = "black") +
+  geom_text(aes(label = lbl), size = 6/.pt) +
+  scale_y_discrete(limit = rev) +
+  scale_fill_gradient2(low = "blue",high = "red", mid = "white",midpoint = 0, space = "Lab",name="β", na.value = "grey") +
+  facet_grid(~ X) +
+  labs(y = "", title = "MSSM - regional differences in brain mitochondrial\nmodules expression with phenotypes") +
+  theme_minimal() +
+  theme(text = element_text(size = 6.5),
+        legend.key.height = unit(0.1, "in"),
+        legend.key.width = unit(0.08, "in"),
+        axis.text.x = element_text(angle = 30, hjust = 0.5),
+        plot.title = element_text(hjust = 0.5, size = 7))
+dev.off()
+
+# plot for Mayo NDUFs ----
+cairo_pdf(paste0(outdir, "/Mayo_NDUFs_contrast.pdf"), width = 2.6, height = 3)
+NDUFRes_pairwise_mayo %>% 
+  mutate(contrast = ifelse(grepl("Control", contrast), gsub("\\(Control - AD |\\)", "", contrast), contrast),
+         X = ifelse(X == "DX", "Control-AD", X),
+         X = factor(X, levels = c("Control-AD", "Thal", "Braak")),
+         lbl = if_else(p.value<0.05, "△", ""),
+         lbl=if_else(q.value<0.05, "✱", lbl)) %>% 
+  complete(X, Y, contrast, fill = list(estimate = NA_real_, p.value = NA_real_)) %>% 
+  ggplot(aes(x = contrast, y = Y)) +
+  geom_tile(aes(fill = estimate), color = "black") +
+  geom_text(aes(label = lbl), size = 6/.pt) +
+  scale_fill_gradient2(low = "blue",high = "red", mid = "white",midpoint = 0, space = "Lab",name="β", na.value = "grey") +
+  facet_grid(~ X) +
+  labs(y = "", title = "Mayo - regional differences in NDUFs\nexpression with phenotypes") +
+  theme_minimal() +
+  theme(text = element_text(size = 6.5),
+        legend.key.height = unit(0.1, "in"),
+        legend.key.width = unit(0.08, "in"),
+        axis.text.y = element_text(face = "italic"),
+        plot.title = element_text(hjust = 0.5, size = 7))
+dev.off()
+
+# plot for MSSM NDUFs ----
+cairo_pdf(paste0(outdir, "/MSSM_NDUFs_contrast.pdf"), width = 4, height = 2.6)
+NDUFRes_pairwise_mssm %>% 
+  mutate(contrast = ifelse(grepl("Control", contrast), gsub("\\(Control - AD |\\)", "", contrast), contrast),
+         X = ifelse(X == "DX", "Control-AD", X),
+         X = factor(X, levels = c("Control-AD", "CERAD", "Braak")),
+         lbl = if_else(p.value<0.05, "△", ""),
+         lbl=if_else(q.value<0.05, "✱", lbl)) %>% 
+  complete(X, Y, contrast, fill = list(estimate = NA_real_, p.value = NA_real_)) %>% 
+  ggplot(aes(x = contrast, y = Y)) +
+  geom_tile(aes(fill = estimate), color = "black") +
+  geom_text(aes(label = lbl), size = 6/.pt) +
+  scale_fill_gradient2(low = "blue",high = "red", mid = "white",midpoint = 0, space = "Lab",name="β", na.value = "grey") +
+  facet_grid(~ X) +
+  labs(y = "", title = "MSSM - regional differences in NDUFs\nexpression with phenotypes") +
+  theme_minimal() +
+  theme(text = element_text(size = 6.5),
+        legend.key.height = unit(0.1, "in"),
+        legend.key.width = unit(0.08, "in"),
+        axis.text.x = element_text(angle = 30, hjust = 0.5),
+        axis.text.y = element_text(face = "italic"),
+        plot.title = element_text(hjust = 0.5, size = 7))
+dev.off()
+
+# illustrative example ----
+pdf(paste0(outdir, "/illustrative_ex.pdf"), width = 12, height = 3)
+MTModsRes_mayo$Plot[[1]] + MTModsRes_mayo$Plot[[2]] + MTModsRes_mayo$Plot[[3]]
+MTModsRes_mssm$Plot[[1]] + MTModsRes_mssm$Plot[[2]] + MTModsRes_mssm$Plot[[3]]
+dev.off()
+```
+
+```{r}
+sessionInfo()
+```
+

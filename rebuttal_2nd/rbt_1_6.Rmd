@@ -1,0 +1,945 @@
+---
+title: "rbt_1.6"
+output: html_document
+date: "2026-08-03"
+---
+
+Author: Wei (Adelyn) Tsai; [tsai.wei\@mayo.edu](mailto:tsai.wei@mayo.edu){.email} If you are using this script, please cite our study. This script addresses comment 6 about prediction analysis opitimization from reviwer 1.
+
+Please refer rebuttal/rbt_2_1_3_BF_TM.Rmd for definition of resilience/non-resilience
+
+# Libraries and directories
+
+```{r}
+library(tidyverse) #v2.0.0
+library(tidymodels) #v1.4.1
+library(openxlsx) #v4.2.8
+library(patchwork) #v1.3.2
+
+tidymodels_prefer()  # resolve function conflicts in favour of tidymodels
+
+set.seed(123)
+
+# list of input/output directories
+indir <- "./indir"
+rbt_v1_dir <- "./Rebuttal/outdir" # directory to the results from the first rebuttal
+blwgcna_dir <- "./outdir/bl_wgcna"
+nduf_assoc_dir <- "./outdir/nduf_assoc_de"
+
+# output directory
+outdir <- "./Rebuttal_2nd/outdir/1_6"
+
+source("./Codes/fns.R") #source a list of frequently used functions
+```
+
+# File prep
+```{r}
+comTrait <- readRDS(paste0(indir,"/comTrait.rds")) # resilience status were determined in rebuttal/rbt_2_1_3_BF_TM.Rmd
+
+comRes <- readRDS(paste0(rbt_v1_dir, "/1_11/comRes_Combat.rds")) # use the combat adjusted residuals since we are training in one dataset and test in another dataset; from rebuttal/rbt_1_11.R
+nduf_bb <- read.csv(paste0(nduf_assoc_dir, "/nduf_bb.csv")) #generated in 4_nduf_assoc_de.R
+
+# select the residuals of NDUFs
+nduf_res <- comRes[,nduf_bb$gene_id]
+nduf_res <- data.frame(nduf_res)
+# rename geneID to gene name of NDUFs
+nduf_res  <- nduf_res  %>% rename_at(vars(1:(ncol(.))), ~ nduf_bb$gene_name[match(names(nduf_res)[1:(ncol(nduf_res))], nduf_bb$gene_id)])
+
+# prepare input dataframes
+mcsa_input <- comTrait[1:105,] %>% 
+  rownames_to_column("SubjectID") %>% 
+  dplyr::select(SubjectID, Sex, Educ, Age, APOE4, starts_with("Res_")) %>% 
+  left_join(nduf_res %>% rownames_to_column("SubjectID")) %>% 
+  mutate(APOE4 = factor(APOE4)) %>% 
+  mutate(across(
+    starts_with("Res_X."),
+    ~ factor(.x, levels = c("Resilient", "Non-resilient"))
+  ))
+
+adni_input <- comTrait[106:196,] %>% 
+  rownames_to_column("SubjectID") %>% 
+  dplyr::select(SubjectID, Sex, Educ, Age, APOE4, starts_with("Res_")) %>% 
+  left_join(nduf_res %>% rownames_to_column("SubjectID")) %>% 
+  mutate(APOE4 = factor(APOE4)) %>% 
+  mutate(across(
+    starts_with("Res_X."),
+    ~ factor(.x, levels = c("Resilient", "Non-resilient"))
+  ))
+
+
+```
+
+# predictive modeling functions
+
+Adopted from: <https://lsinks.github.io/posts/2023-04-10-tidymodels/tidymodels_tutorial.html#defining-the-model-with-parsnip>
+
+```{r classification}
+
+modeling <- function(
+    train_data,
+    test_data,
+    outcome_col,
+    covar_col,
+    gene_col,
+    mode = c("separate", "all") # test all or separate genes at a time
+){
+  mode <- match.arg(mode)
+  
+  # remove any NA and select only needed columns
+  train_data <- train_data %>% 
+    drop_na(outcome_col, covar_col, gene_col) %>% 
+    dplyr::select(all_of(c(outcome_col, covar_col, gene_col))) 
+  
+  test_data <- test_data %>% 
+    drop_na(outcome_col, covar_col, gene_col) %>% 
+    dplyr::select(all_of(c(outcome_col, covar_col, gene_col))) 
+  
+  # create data_split 
+  data_split <- make_splits(
+    x = train_data,   
+    assessment = test_data
+  )
+  
+  # set up dataframe for metrics and coefficients ----
+  metrics <- data.frame()
+  coefs   <- data.frame()
+  preds   <- data.frame()
+  auc_comp<- data.frame()
+  
+  # Define ----
+  ## 1) models ----
+  ### standard logistic regression
+  logreg_spec <- 
+    logistic_reg() %>% 
+    set_engine("glm") %>% 
+    set_mode("classification")
+  
+  ### ridge regularization
+  ridge_spec <- 
+    logistic_reg(penalty = tune(),
+                 mixture = 0) %>%
+    set_engine("glmnet") %>% 
+    set_mode("classification")
+  
+  ### elastic net regularization
+  en_spec <- 
+    logistic_reg(penalty = tune(),
+                 mixture = tune()) %>%
+    set_engine("glmnet") %>% 
+    set_mode("classification")
+  
+  ## 2) metrics to evaluate ----
+  custom_metric_set = metric_set(roc_auc, sensitivity, specificity, brier_class)
+  
+  ## 3) formula ----
+  formula_cov = as.formula(paste0(outcome_col, " ~ Sex + Educ + Age + APOE4"))
+  formula_full = as.formula(paste0(outcome_col, " ~ ", paste0(c(covar_col, gene_col), collapse = " + ")))
+  formula_gene = as.formula(paste0(outcome_col, " ~ ", paste0(gene_col, collapse = " + ")))
+  
+  ## 4) Create recipe ----
+  recipe_cov <- recipe(formula_cov, data = train_data) %>% 
+    step_dummy(all_nominal_predictors()) %>% 
+    step_nzv(all_predictors()) %>% 
+    step_normalize(all_numeric_predictors())
+  recipe_full <- recipe(formula_full, data = train_data) %>% 
+    step_dummy(all_nominal_predictors()) %>% 
+    step_nzv(all_predictors()) %>% 
+    step_normalize(all_numeric_predictors())
+  recipe_gene <- recipe(formula_gene, data = train_data) %>% 
+    step_dummy(all_nominal_predictors()) %>% 
+    step_nzv(all_predictors()) %>% 
+    step_normalize(all_numeric_predictors())
+  
+  ## Helper functions ----
+  ### define metrics calculation function
+  cal_metrics <- function(data, prob_col, class_col){
+    
+    metric_data <- tibble(
+      truth = data$truth,
+      pred_class = data[[class_col]],
+      probability = data[[prob_col]]
+    )
+    
+    # yardstick metrics
+    yardstick_metrics <- custom_metric_set(
+      metric_data,
+      truth = truth,
+      estimate = pred_class,
+      probability
+    ) %>%
+      dplyr::select(.metric, .estimate)
+    
+    # calibration
+    y_num   <- as.numeric(metric_data$truth == levels(metric_data$truth)[1])
+    cal <- rms::val.prob(metric_data$probability, y_num, pl = F)
+    calibration <- 
+      tibble(".metric" = c("calibration_intercept", "calibration_slope"),
+             ".estimate" = c(cal[["Intercept"]], cal[["Slope"]])
+      )
+    
+    bind_rows(
+      yardstick_metrics,
+      calibration
+    )
+  }
+  
+  
+  ### Perform AUC/ROC test
+  roc_sig_test <- function(dat, seed = 1){
+    roc_cov <- pROC::roc(dat$truth, dat$.pred_prob_cov, levels = rev(levels(dat$truth)), direction = "<")
+    roc_full <- pROC::roc(dat$truth, dat$.pred_prob_full, levels = rev(levels(dat$truth)), direction = "<")
+    
+    set.seed(1)
+    venkatram <- pROC::roc.test(roc_cov, roc_full,
+                                method = "venkatraman",   # permutation test
+                                paired = TRUE,            # correct here — same subjects, two prediction sets
+                                boot.n = 2000              # number of permutations
+    )
+    delong <- pROC::roc.test(roc_cov, roc_full,
+                             method = "delong",   # permutation test
+                             paired = TRUE            # correct here — same subjects, two prediction sets
+    )
+    auc_comp <- tibble("Venkatram" = venkatram$p.value, "DeLong" = delong$p.value)
+  }
+  
+  ## fit the model (mode = separate) ----
+  if (mode == "separate"){
+    
+    ## create workflow
+    wf_cov <- workflow() %>% 
+      add_recipe(recipe_cov) %>% 
+      add_model(logreg_spec)
+    wf_full <- workflow() %>% 
+      add_recipe(recipe_full) %>% 
+      add_model(logreg_spec)
+    wf_gene <- workflow() %>% 
+      add_recipe(recipe_gene) %>% 
+      add_model(logreg_spec)
+    
+    ## fitting
+    last_fit_cov <- last_fit(wf_cov, data_split, metrics = custom_metric_set)
+    last_fit_full <- last_fit(wf_full, data_split, metrics = custom_metric_set)
+    last_fit_gene <- last_fit(wf_gene, data_split, metrics = custom_metric_set)
+    
+    ## collect coefficients (establish from train_data)
+    coefs <- rbind(
+      coefs,
+      last_fit_cov %>% extract_fit_parsnip() %>% tidy() %>% mutate(covariate_only = TRUE),
+      last_fit_full %>% extract_fit_parsnip() %>% tidy() %>% mutate(covariate_only = FALSE),
+      last_fit_gene %>% extract_fit_parsnip() %>% tidy() %>% mutate(covariate_only = FALSE)
+    )
+    
+    ## collect predictions (prediction on test_data)
+    pred_cur_cov <- last_fit_cov %>% collect_predictions() %>% dplyr::select({{outcome_col}}, .pred_class, .pred_Resilient, .row) %>% rename(.pred_prob_cov = .pred_Resilient, .pred_class_cov = .pred_class, truth = {{outcome_col}})
+    pred_cur_full <- last_fit_full %>% collect_predictions() %>% dplyr::select({{outcome_col}}, .pred_class, .pred_Resilient, .row) %>% rename(.pred_prob_full = .pred_Resilient, .pred_class_full = .pred_class, truth_full = {{outcome_col}})
+    pred_cur_gene <- last_fit_gene %>% collect_predictions() %>% dplyr::select({{outcome_col}}, .pred_class, .pred_Resilient, .row) %>% rename(.pred_prob_gene = .pred_Resilient, .pred_class_gene = .pred_class, truth_gene = {{outcome_col}})
+    
+    pred_cur <- pred_cur_cov %>% left_join(pred_cur_full, by = ".row") %>% left_join(pred_cur_gene, by = ".row") %>% mutate(model_type = "logreg")
+    
+    # Check that truth is identical
+    if (!all(
+      pred_cur$truth == pred_cur$truth_full & pred_cur$truth_full == pred_cur$truth_gene
+    )) {
+      stop(
+        "The three last_fit objects do not appear to contain
+       predictions for the same observations in the same order."
+      )
+    }
+    
+    preds <- rbind(
+      preds,
+      pred_cur
+    ) %>% 
+      dplyr::select(-truth_full, -truth_gene) %>% 
+      relocate(.row, .before = "truth")
+    
+    ## collect metrics (evaluated on test_data)
+    ### get the point estimates
+    point_cov <- cal_metrics(pred_cur, prob_col = ".pred_prob_cov", class_col = ".pred_class_cov") %>% rename(.estimate_cov = .estimate)
+    point_full <- cal_metrics(pred_cur, prob_col = ".pred_prob_full", class_col = ".pred_class_full") %>% rename(.estimate_full = .estimate)
+    point_gene <- cal_metrics(pred_cur, prob_col = ".pred_prob_gene", class_col = ".pred_class_gene") %>% rename(.estimate_gene = .estimate)
+    point <- point_cov %>% left_join(point_full, by = ".metric") %>% left_join(point_gene, by = ".metric") %>% mutate(model_type = "logreg")
+    
+    metrics <- rbind(
+      metrics,
+      point
+    ) %>% 
+      mutate(delta_metric = .estimate_full - .estimate_cov, .after = ".estimate_full")
+    
+    ## perform ROC AUC test
+    auc_comp_cur = roc_sig_test(dat = pred_cur) %>% mutate(model_type = "logreg")
+    
+    auc_comp <- rbind(
+      auc_comp,
+      auc_comp_cur
+    )
+    
+  }
+  
+  ## fit the model (mode = all) ----
+  else if (mode == "all"){
+    ## create workflow
+    wf_tune_cov <- 
+      workflow_set(
+        list(data = recipe_cov),
+        list(logreg = logreg_spec, ridge = ridge_spec, en = en_spec)
+      )
+    wf_tune_full <- 
+      workflow_set(
+        list(data = recipe_full),
+        list(logreg = logreg_spec, ridge = ridge_spec, en = en_spec)
+      )
+    wf_tune_gene <- 
+      workflow_set(
+        list(data = recipe_gene),
+        list(logreg = logreg_spec, ridge = ridge_spec, en = en_spec)
+      )
+    
+    ## tuning
+    set.seed(1234)
+    folds <- vfold_cv(train_data, v = 10, strata = outcome_col)
+    tune_results_cov <- 
+      workflow_map(
+        wf_tune_cov,
+        "tune_grid",
+        resamples = folds,
+        grid = 10,
+        metrics = custom_metric_set,
+        verbose = F
+      )
+    tune_results_full <- 
+      workflow_map(
+        wf_tune_full,
+        "tune_grid",
+        resamples = folds,
+        grid = 10,
+        metrics = custom_metric_set,
+        verbose = F
+      )
+    tune_results_gene <- 
+      workflow_map(
+        wf_tune_gene,
+        "tune_grid",
+        resamples = folds,
+        grid = 10,
+        metrics = custom_metric_set,
+        verbose = F
+      )
+    
+    ## get best parameters (for ridge and en) and fitting 
+    
+    ### logreg
+    validation_logreg_cov <- tune_results_cov %>% extract_workflow("data_logreg") %>% last_fit(split =  data_split, metrics = custom_metric_set)
+    validation_logreg_full <- tune_results_full %>% extract_workflow("data_logreg") %>% last_fit(split =  data_split, metrics = custom_metric_set)
+    validation_logreg_gene <- tune_results_gene %>% extract_workflow("data_logreg") %>% last_fit(split =  data_split, metrics = custom_metric_set)
+    
+    ### ridge
+    best_ridge_cov <- tune_results_cov %>% extract_workflow_set_result("data_ridge") %>% select_best(metric = "roc_auc")
+    validation_ridge_cov <- tune_results_cov %>% extract_workflow("data_ridge") %>% finalize_workflow(best_ridge_cov) %>% last_fit(split =  data_split, metrics = custom_metric_set)
+    
+    best_ridge_full <- tune_results_full %>% extract_workflow_set_result("data_ridge") %>% select_best(metric = "roc_auc")
+    validation_ridge_full <- tune_results_full %>% extract_workflow("data_ridge") %>% finalize_workflow(best_ridge_full) %>% last_fit(split =  data_split, metrics = custom_metric_set)
+    
+    best_ridge_gene <- tune_results_gene %>% extract_workflow_set_result("data_ridge") %>% select_best(metric = "roc_auc")
+    validation_ridge_gene <- tune_results_gene %>% extract_workflow("data_ridge") %>% finalize_workflow(best_ridge_gene) %>% last_fit(split =  data_split, metrics = custom_metric_set)
+    
+    ### EN
+    best_en_cov <- tune_results_cov %>% extract_workflow_set_result("data_en") %>% select_best(metric = "roc_auc")
+    validation_en_cov <- tune_results_cov %>% extract_workflow("data_en") %>% finalize_workflow(best_en_cov) %>% last_fit(split =  data_split, metrics = custom_metric_set)
+    
+    best_en_full <- tune_results_full %>% extract_workflow_set_result("data_en") %>% select_best(metric = "roc_auc")
+    validation_en_full <- tune_results_full %>% extract_workflow("data_en") %>% finalize_workflow(best_en_full) %>% last_fit(split =  data_split, metrics = custom_metric_set)
+    
+    best_en_gene <- tune_results_gene %>% extract_workflow_set_result("data_en") %>% select_best(metric = "roc_auc")
+    validation_en_gene <- tune_results_gene %>% extract_workflow("data_en") %>% finalize_workflow(best_en_gene) %>% last_fit(split =  data_split, metrics = custom_metric_set)
+    
+    ## collect coefficients
+    coefs <- rbind(
+      coefs,
+      validation_logreg_cov %>% extract_fit_parsnip() %>% tidy() %>% dplyr::select(term, estimate) %>% mutate(penalty = NA, model_type = "logreg", covariate_only = TRUE),
+      validation_logreg_full %>% extract_fit_parsnip() %>% tidy() %>% dplyr::select(term, estimate) %>% mutate(penalty = NA, model_type = "logreg", covariate_only = FALSE),
+      validation_logreg_gene %>% extract_fit_parsnip() %>% tidy() %>% dplyr::select(term, estimate) %>% mutate(penalty = NA, model_type = "logreg", covariate_only = FALSE),
+      validation_ridge_cov %>% extract_fit_parsnip() %>% tidy() %>% mutate(model_type = "ridge", covariate_only = TRUE),
+      validation_ridge_full %>% extract_fit_parsnip() %>% tidy() %>% mutate(model_type = "ridge", covariate_only = FALSE),
+      validation_ridge_gene %>% extract_fit_parsnip() %>% tidy() %>% mutate(model_type = "ridge", covariate_only = FALSE),
+      validation_en_cov %>% extract_fit_parsnip() %>% tidy() %>% mutate(model_type = "en", covariate_only = TRUE),
+      validation_en_full %>% extract_fit_parsnip() %>% tidy() %>% mutate(model_type = "en", covariate_only = TRUE),
+      validation_en_gene %>% extract_fit_parsnip() %>% tidy() %>% mutate(model_type = "en", covariate_only = FALSE)
+    )
+    
+    ## collect predictions
+    pred_cur_logreg_cov <- validation_logreg_cov %>% collect_predictions() %>% dplyr::select({{outcome_col}}, .pred_class, .pred_Resilient, .row) %>% rename(.pred_prob_cov = .pred_Resilient, .pred_class_cov = .pred_class, truth = {{outcome_col}})
+    pred_cur_logreg_full <- validation_logreg_full %>% collect_predictions() %>% dplyr::select({{outcome_col}}, .pred_class, .pred_Resilient, .row) %>% rename(.pred_prob_full = .pred_Resilient, .pred_class_full = .pred_class, truth_full = {{outcome_col}})
+    pred_cur_logreg_gene <- validation_logreg_gene %>% collect_predictions() %>% dplyr::select({{outcome_col}}, .pred_class, .pred_Resilient, .row) %>% rename(.pred_prob_gene = .pred_Resilient, .pred_class_gene = .pred_class, truth_gene = {{outcome_col}})
+    
+    pred_cur_ridge_cov <- validation_ridge_cov %>% collect_predictions() %>% dplyr::select({{outcome_col}}, .pred_class, .pred_Resilient, .row) %>% rename(.pred_prob_cov = .pred_Resilient,  .pred_class_cov = .pred_class, truth = {{outcome_col}})
+    pred_cur_ridge_full <- validation_ridge_full %>% collect_predictions() %>% dplyr::select({{outcome_col}}, .pred_class, .pred_Resilient, .row) %>% rename(.pred_prob_full = .pred_Resilient, .pred_class_full = .pred_class, truth_full = {{outcome_col}})
+    pred_cur_ridge_gene <- validation_ridge_gene %>% collect_predictions() %>% dplyr::select({{outcome_col}}, .pred_class, .pred_Resilient, .row) %>% rename(.pred_prob_gene = .pred_Resilient, .pred_class_gene = .pred_class, truth_gene = {{outcome_col}})
+    
+    pred_cur_en_cov <- validation_en_cov %>% collect_predictions() %>% dplyr::select({{outcome_col}}, .pred_class, .pred_Resilient, .row) %>% rename(.pred_prob_cov = .pred_Resilient,  .pred_class_cov = .pred_class, truth = {{outcome_col}})
+    pred_cur_en_full <- validation_en_full %>% collect_predictions() %>% dplyr::select({{outcome_col}}, .pred_class, .pred_Resilient, .row) %>% rename(.pred_prob_full = .pred_Resilient, .pred_class_full = .pred_class, truth_full = {{outcome_col}})
+    pred_cur_en_gene <- validation_en_gene %>% collect_predictions() %>% dplyr::select({{outcome_col}}, .pred_class, .pred_Resilient, .row) %>% rename(.pred_prob_gene = .pred_Resilient, .pred_class_gene = .pred_class, truth_gene = {{outcome_col}})
+    
+    pred_logreg <- pred_cur_logreg_cov %>% left_join(pred_cur_logreg_full, by = ".row") %>% left_join(pred_cur_logreg_gene, by = ".row") %>%  mutate(model_type = "logreg")
+    pred_ridge <- pred_cur_ridge_cov %>% left_join(pred_cur_ridge_full, by = ".row") %>% left_join(pred_cur_ridge_gene, by = ".row") %>%  mutate(model_type = "ridge")
+    pred_en <- pred_cur_en_cov %>% left_join(pred_cur_en_full, by = ".row") %>% left_join(pred_cur_en_gene, by = ".row") %>% mutate(model_type = "en")
+    
+    # Check that truth is identical
+    if (!all(
+      pred_logreg$truth == pred_logreg$truth_full & pred_ridge$truth == pred_ridge$truth_full & pred_en$truth == pred_en$truth_full &
+      pred_logreg$truth == pred_logreg$truth_gene & pred_ridge$truth == pred_ridge$truth_gene & pred_en$truth == pred_en$truth_gene
+    )) {
+      stop(
+        "The three last_fit objects do not appear to contain
+       predictions for the same observations in the same order."
+      )
+    }
+    
+    preds <- rbind(
+      preds,
+      pred_logreg,
+      pred_ridge,
+      pred_en
+    ) %>% 
+      dplyr::select(-truth_full, -truth_gene) %>% 
+       relocate(.row, .before = "truth")
+    
+    
+    ## collect metrics
+    ### get the point estimates
+    point_logreg_cov <- cal_metrics(pred_logreg, prob_col = ".pred_prob_cov", class_col = ".pred_class_cov") %>% rename(.estimate_cov = .estimate)
+    point_logreg_full <- cal_metrics(pred_logreg, prob_col = ".pred_prob_full", class_col = ".pred_class_full") %>% rename(.estimate_full = .estimate)
+    point_logreg_gene <- cal_metrics(pred_logreg, prob_col = ".pred_prob_gene", class_col = ".pred_class_gene") %>% rename(.estimate_gene = .estimate)
+    point_logreg <- point_logreg_cov %>% left_join(point_logreg_full, by = ".metric") %>% left_join(point_logreg_gene, by = ".metric") %>% mutate(model_type = "logreg")
+    
+    point_ridge_cov <- cal_metrics(pred_ridge, prob_col = ".pred_prob_cov", class_col = ".pred_class_cov") %>% rename(.estimate_cov = .estimate)
+    point_ridge_full <- cal_metrics(pred_ridge, prob_col = ".pred_prob_full", class_col = ".pred_class_full") %>% rename(.estimate_full = .estimate)
+    point_ridge_gene <- cal_metrics(pred_ridge, prob_col = ".pred_prob_gene", class_col = ".pred_class_gene") %>% rename(.estimate_gene = .estimate)
+    point_ridge <- point_ridge_cov %>% left_join(point_ridge_full, by = ".metric") %>% left_join(point_ridge_gene, by = ".metric") %>% mutate(model_type = "ridge")
+    
+    point_en_cov <- cal_metrics(pred_en, prob_col = ".pred_prob_cov", class_col = ".pred_class_cov") %>% rename(.estimate_cov = .estimate)
+    point_en_full <- cal_metrics(pred_en, prob_col = ".pred_prob_full", class_col = ".pred_class_full") %>% rename(.estimate_full = .estimate)
+    point_en_gene <- cal_metrics(pred_en, prob_col = ".pred_prob_gene", class_col = ".pred_class_gene") %>% rename(.estimate_gene = .estimate)
+    point_en <- point_en_cov %>% left_join(point_en_full, by = ".metric") %>% left_join(point_en_gene, by = ".metric") %>% mutate(model_type = "en")
+    
+    
+    metrics <- rbind(
+      metrics,
+      point_logreg,
+      point_ridge,
+      point_en
+    ) %>% 
+      mutate(delta_metric = .estimate_full - .estimate_cov, .after = ".estimate_full")
+    
+    ## perform ROC AUC test
+    auc_comp_logreg = roc_sig_test(dat = pred_logreg) %>% mutate(model_type = "logreg")
+    auc_comp_ridge = roc_sig_test(dat = pred_ridge) %>% mutate(model_type = "ridge")
+    auc_comp_en = roc_sig_test(dat = pred_en) %>% mutate(model_type = "en")
+   
+    auc_comp <- rbind(
+      auc_comp,
+      auc_comp_logreg,
+      auc_comp_ridge,
+      auc_comp_en
+    )
+  }
+  
+  # Final storage 
+  list(
+    metrics_all = metrics,
+    preds_all   = preds,
+    coef_all    = coefs,
+    auc_comp    = auc_comp
+  )
+}
+
+run_modeling <- function(
+  train_data,
+  test_data,
+  outcome_cols, 
+  gene_vars,
+  covars,
+  mode = c("separate", "all")
+){
+  mode <- match.arg(mode)
+  
+  # store all results by outcome
+  results <- list()
+  
+  for (outcome in outcome_cols) {
+    print(paste0("OUTCOME: ", outcome))
+    
+    results[[outcome]] <- list()
+    
+    ## ----------------------------------------------------------
+    ## MODE 1: EACH GENE SEPARATELY
+    ## ----------------------------------------------------------
+    if (mode == "separate") {
+      
+      separate_list <- list()
+      
+      for (g in gene_vars) {
+
+        print(paste0("Running gene: ", g))
+        
+        separate_list[[g]] <-
+          modeling(
+            train_data    = train_data,
+            test_data     = test_data,
+            outcome_col   = outcome,
+            covar_col     = covars,
+            gene_col      = g,
+            mode          = mode
+          )
+      }
+      
+      results[[outcome]] <- separate_list
+    }
+    
+    ## ----------------------------------------------------------
+    ## MODE 2: ALL GENES AT ONCE
+    ## ----------------------------------------------------------
+    if (mode == "all") {
+
+      print("Running: all genes together")
+      
+      results[[outcome]] <-
+        modeling(
+          train_data    = train_data,
+          test_data     = test_data,
+          outcome_col   = outcome,
+          covar_col     = covars,
+          gene_col      = gene_vars,
+          mode          = mode
+        )
+    }
+  }
+  
+  return(results)
+}
+
+
+```
+
+
+| Column name      | Residual method to define          |
+|------------------|------------------------------------|
+| Res_X.Age_Y.Mem  | No centiloids, memory as outcome   |
+| Res_X.Age_Y.LMDR | No centiloids, LMDR as outcome     |
+| Res_X.CL_Y.Mem   | With centiloids, memory as outcome |
+| Res_X.CL_Y.LMDR  | With centiloids, LMDR as outcome   |
+
+
+# run modeling
+```{r}
+start_time = Sys.time()
+m2a_sep <- run_modeling(
+  train_data = mcsa_input,
+  test_data = adni_input,
+  outcome_cols = c("Res_X.Age_Y.Mem", "Res_X.Age_Y.LMDR", "Res_X.CL_Y.Mem", "Res_X.CL_Y.LMDR"),
+  covars = c("Sex", "Educ", "Age", "APOE4"),
+  gene_vars = nduf_bb$gene_name,
+  mode = "separate"
+)
+
+m2a_all <- run_modeling(
+  train_data = mcsa_input,
+  test_data = adni_input,
+  outcome_cols = c("Res_X.Age_Y.Mem", "Res_X.Age_Y.LMDR", "Res_X.CL_Y.Mem", "Res_X.CL_Y.LMDR"),
+  covars = c("Sex", "Educ", "Age", "APOE4"),
+  gene_vars = nduf_bb$gene_name,
+  mode = "all"
+)
+
+a2m_sep <- run_modeling(
+  train_data = adni_input,
+  test_data = mcsa_input,
+  outcome_cols = c("Res_X.Age_Y.Mem", "Res_X.Age_Y.LMDR", "Res_X.CL_Y.Mem", "Res_X.CL_Y.LMDR"),
+  covars = c("Sex", "Educ", "Age", "APOE4"),
+  gene_vars = nduf_bb$gene_name,
+  mode = "separate"
+)
+
+a2m_all <- run_modeling(
+  train_data = adni_input,
+  test_data = mcsa_input,
+  outcome_cols = c("Res_X.Age_Y.Mem", "Res_X.Age_Y.LMDR", "Res_X.CL_Y.Mem", "Res_X.CL_Y.LMDR"),
+  covars = c("Sex", "Educ", "Age", "APOE4"),
+  gene_vars = nduf_bb$gene_name,
+  mode = "all"
+)
+save(m2a_sep, m2a_all, a2m_sep, a2m_all, file = paste0(outdir, "/results.RData"))
+end_time = Sys.time()
+message("Spent: ", end_time - start_time)
+```
+
+# organize the results
+## MSCA to ADNI
+```{r separate mode}
+m2a_sep_metrics <- map_df(
+  names(m2a_sep),
+  function(outcome) {
+    map_df(
+      names(m2a_sep[[outcome]]),
+      function(x) {
+        m2a_sep[[outcome]][[x]]$metrics_all %>%
+          mutate(Outcome = outcome, Gene = x)
+      }
+    )
+  }
+) %>% 
+  arrange(Outcome, Gene) %>% 
+  relocate(c(Outcome, Gene), .before = ".metric")
+  
+m2a_sep_auc_comp <- map_df(
+  names(m2a_sep),
+  function(outcome) {
+    map_df(
+      names(m2a_sep[[outcome]]),
+      function(x) {
+        m2a_sep[[outcome]][[x]]$auc_comp %>%
+          mutate(Outcome = outcome, Gene = x)
+      }
+    )
+  }
+)
+# process to get a dataframe focusing on AUC
+m2a_auc <- m2a_sep_metrics %>% 
+  filter(.metric == "roc_auc") %>% 
+  left_join(m2a_sep_auc_comp, by = c("Outcome", "Gene", "model_type"))
+
+rm(m2a_sep_auc_comp)
+
+m2a_auc  
+```
+
+```{r all mode}
+m2a_all_metrics <- map_df(
+  names(m2a_all),
+  function(outcome) {
+      m2a_all[[outcome]]$metrics_all %>%
+          mutate(Outcome = outcome)
+  }
+) %>% 
+  mutate(Gene = "All 20 NDUFs") %>%  
+  relocate(c(Outcome, Gene, model_type), .before = ".metric")
+
+# combine the metrics dataframe
+m2a_metrics <- m2a_sep_metrics %>% rbind(m2a_all_metrics)
+  
+m2a_all_auc_comp <- map_df(
+  names(m2a_all),
+  function(outcome) {
+    m2a_all[[outcome]]$auc_comp %>%
+          mutate(Outcome = outcome)
+  }
+)
+# process to get a dataframe focusing on AUC
+m2a_auc <- m2a_auc %>% 
+  rbind(
+    m2a_all_metrics %>% 
+      filter(.metric == "roc_auc") %>% 
+      left_join(m2a_all_auc_comp, by = c("Outcome", "model_type"))
+    )
+
+rm(m2a_sep_metrics, m2a_all_metrics, m2a_all_auc_comp)
+
+m2a_metrics
+m2a_auc
+```
+
+
+## ADNI to MCSA
+```{r separate mode}
+a2m_sep_metrics <- map_df(
+  names(a2m_sep),
+  function(outcome) {
+    map_df(
+      names(a2m_sep[[outcome]]),
+      function(x) {
+        a2m_sep[[outcome]][[x]]$metrics_all %>%
+          mutate(Outcome = outcome, Gene = x)
+      }
+    )
+  }
+) %>% 
+  arrange(Outcome, Gene) %>%
+  relocate(c(Outcome, Gene), .before = ".metric")
+  
+a2m_sep_auc_comp <- map_df(
+  names(a2m_sep),
+  function(outcome) {
+    map_df(
+      names(a2m_sep[[outcome]]),
+      function(x) {
+        a2m_sep[[outcome]][[x]]$auc_comp %>%
+          mutate(Outcome = outcome, Gene = x)
+      }
+    )
+  }
+)
+# process to get a dataframe focusing on AUC
+a2m_auc <- a2m_sep_metrics %>% 
+  filter(.metric == "roc_auc") %>% 
+  left_join(a2m_sep_auc_comp, by = c("Outcome", "Gene", "model_type"))
+
+rm(a2m_sep_auc_comp)
+
+a2m_auc
+```
+
+```{r all mode}
+a2m_all_metrics <- map_df(
+  names(a2m_all),
+  function(outcome) {
+      a2m_all[[outcome]]$metrics_all %>%
+          mutate(Outcome = outcome)
+  }
+) %>% 
+  mutate(Gene = "All 20 NDUFs") %>%  
+  relocate(c(Outcome, Gene, model_type), .before = ".metric")
+
+# combine the metrics dataframe
+a2m_metrics <- a2m_sep_metrics %>% rbind(a2m_all_metrics)
+  
+a2m_all_auc_comp <- map_df(
+  names(a2m_all),
+  function(outcome) {
+    a2m_all[[outcome]]$auc_comp %>%
+          mutate(Outcome = outcome)
+  }
+)
+# process to get a dataframe focusing on AUC
+a2m_auc <- a2m_auc %>% 
+  rbind(
+    a2m_all_metrics %>% 
+      filter(.metric == "roc_auc") %>% 
+      left_join(a2m_all_auc_comp, by = c("Outcome", "model_type"))
+    )
+
+rm(a2m_sep_metrics, a2m_all_metrics, a2m_all_auc_comp)
+
+a2m_metrics
+a2m_auc
+```
+
+## save the dataframe
+```{r}
+m2a_metrics = m2a_metrics %>% 
+  mutate(Outcome = case_when(
+    Outcome == "Res_X.Age_Y.Mem" ~ "Memory (no CL)",
+    Outcome == "Res_X.Age_Y.LMDR" ~ "LMDR (no CL)",
+    Outcome == "Res_X.CL_Y.Mem" ~ "Memory (with CL)",
+    Outcome == "Res_X.CL_Y.LMDR" ~ "LMDR (with CL)"
+  ))
+m2a_auc = m2a_auc %>% 
+  mutate(Outcome = case_when(
+    Outcome == "Res_X.Age_Y.Mem" ~ "Memory (no CL)",
+    Outcome == "Res_X.Age_Y.LMDR" ~ "LMDR (no CL)",
+    Outcome == "Res_X.CL_Y.Mem" ~ "Memory (with CL)",
+    Outcome == "Res_X.CL_Y.LMDR" ~ "LMDR (with CL)"
+  ))
+a2m_metrics = a2m_metrics %>% 
+  mutate(Outcome = case_when(
+    Outcome == "Res_X.Age_Y.Mem" ~ "Memory (no CL)",
+    Outcome == "Res_X.Age_Y.LMDR" ~ "LMDR (no CL)",
+    Outcome == "Res_X.CL_Y.Mem" ~ "Memory (with CL)",
+    Outcome == "Res_X.CL_Y.LMDR" ~ "LMDR (with CL)"
+  ))
+a2m_auc = a2m_auc %>% 
+  mutate(Outcome = case_when(
+    Outcome == "Res_X.Age_Y.Mem" ~ "Memory (no CL)",
+    Outcome == "Res_X.Age_Y.LMDR" ~ "LMDR (no CL)",
+    Outcome == "Res_X.CL_Y.Mem" ~ "Memory (with CL)",
+    Outcome == "Res_X.CL_Y.LMDR" ~ "LMDR (with CL)"
+  ))
+
+write.xlsx(list(
+  "Metrics_Train-MCSA_Test-ADNI" = m2a_metrics,
+  "AUC_Train-MCSA_Test-ADNI" = m2a_auc,
+  "Metrics_Train-ADNI_Test-ADNI" = a2m_metrics,
+  "AUC_Train-ADNI_Test-MCSA" = a2m_auc
+  ),
+  paste0(outdir, "/metrics_auc.xlsx")
+) # these tables are organized into Supplementary Table 14b
+```
+
+# Plot
+## Distribution of CR scores
+This is in Extended Data Fig.12d
+```{r}
+CRdf_mcsa = read.xlsx(paste0(rbt_v1_dir, "/2_1_3_BF/CRdf_2yrs.xlsx"), sheet = "MCSA") # from rebuttal/rbt_2_1_3_BF_TM.Rmd
+CRdf_adni = read.xlsx(paste0(rbt_v1_dir, "/2_1_3_BF/CRdf_2yrs.xlsx"), sheet = "ADNI")
+
+pdf(paste0(outdir, "/residuals_distribution.pdf"), width = 5.5, height = 3.5)
+CRdf_mcsa %>% 
+  dplyr::select(SubjectID, starts_with("CR_X.")) %>% 
+  mutate(Cohort = "MCSA") %>% 
+  rbind(CRdf_adni %>% dplyr::select(SubjectID, starts_with("CR_X.")) %>% mutate(Cohort = "ADNI")) %>% 
+  pivot_longer(starts_with("CR_X."), names_to = "Outcome", values_to = "CR") %>% 
+  mutate(Cohort = factor(Cohort, levels = c("MCSA", "ADNI"))) %>% 
+  mutate(Outcome = case_when(
+    Outcome == "CR_X.Age_Y.Mem" ~ "Memory (no CL)",
+    Outcome == "CR_X.Age_Y.LMDR" ~ "LMDR (no CL)",
+    Outcome == "CR_X.CL_Y.Mem" ~ "Memory (with CL)",
+    Outcome == "CR_X.CL_Y.LMDR" ~ "LMDR (with CL)"
+  )) %>% 
+  ggplot(aes(x = CR)) +
+  geom_histogram(bins = 8, color = "black", aes(fill = Cohort)) +
+  facet_grid(Cohort ~ Outcome, scales = "free") +
+  labs(x = "Residuals") +
+  theme_bw() +
+  theme(legend.position = "none")
+dev.off()
+```
+
+## ROC curves
+Plot for NDUFA9, NDUFV1, NDUFB8.
+These are in Fig.3c and Extended Data Fig.12e
+```{r LMDR no CL}
+# Extract ROC data for plotting
+roc_m2a_4p <- m2a_sep$Res_X.Age_Y.LMDR$NDUFA9$preds_all %>%
+  roc_curve(truth = truth, .pred_prob_gene) %>%
+  mutate(Gene = "NDUFA9", 
+         AUC = subset(m2a_sep$Res_X.Age_Y.LMDR$NDUFA9$metrics_all, .metric == "roc_auc")$.estimate_gene,
+         lbl = paste0(Gene, " (AUC = ", round(AUC,2), ")")) %>% 
+  rbind(
+    m2a_sep$Res_X.Age_Y.LMDR$NDUFV1$preds_all %>%
+      roc_curve(truth = truth, .pred_prob_gene) %>%
+      mutate(Gene = "NDUFV1", 
+             AUC = subset(m2a_sep$Res_X.Age_Y.LMDR$NDUFV1$metrics_all, .metric == "roc_auc")$.estimate_gene,
+             lbl = paste0(Gene, " (AUC = ", round(AUC,2), ")"))
+    ) %>% 
+  rbind(
+    m2a_sep$Res_X.Age_Y.LMDR$NDUFB8$preds_all %>%
+      roc_curve(truth = truth, .pred_prob_gene) %>%
+      mutate(Gene = "NDUFB8", 
+             AUC = subset(m2a_sep$Res_X.Age_Y.LMDR$NDUFB8$metrics_all, .metric == "roc_auc")$.estimate_gene,
+             lbl = paste0(Gene, " (AUC = ", round(AUC,2), ")"))
+  )
+roc_a2m_4p <- a2m_sep$Res_X.Age_Y.LMDR$NDUFA9$preds_all %>%
+  roc_curve(truth = truth, .pred_prob_gene) %>%
+  mutate(Gene = "NDUFA9", 
+         AUC = subset(a2m_sep$Res_X.Age_Y.LMDR$NDUFA9$metrics_all, .metric == "roc_auc")$.estimate_gene,
+         lbl = paste0(Gene, " (AUC = ", round(AUC,2), ")")) %>% 
+  rbind(
+    a2m_sep$Res_X.Age_Y.LMDR$NDUFV1$preds_all %>%
+      roc_curve(truth = truth, .pred_prob_gene) %>%
+      mutate(Gene = "NDUFV1", 
+             AUC = subset(a2m_sep$Res_X.Age_Y.LMDR$NDUFV1$metrics_all, .metric == "roc_auc")$.estimate_gene,
+             lbl = paste0(Gene, " (AUC = ", round(AUC,2), ")"))
+  ) %>% 
+  rbind(
+    a2m_sep$Res_X.Age_Y.LMDR$NDUFB8$preds_all %>%
+      roc_curve(truth = truth, .pred_prob_gene) %>%
+      mutate(Gene = "NDUFB8", 
+             AUC = subset(a2m_sep$Res_X.Age_Y.LMDR$NDUFB8$metrics_all, .metric == "roc_auc")$.estimate_gene,
+             lbl = paste0(Gene, " (AUC = ", round(AUC,2), ")"))
+  )
+
+
+p1 <- roc_m2a_4p %>% 
+  mutate(Gene = factor(Gene, levels = c("NDUFA9", "NDUFV1", "NDUFB8"))) %>% 
+  ggplot(aes(x = 1 - specificity, y = sensitivity, color=Gene)) +
+  geom_path() +
+  geom_abline(lty = 3) +
+  scale_color_manual(
+    labels = unique(roc_m2a_4p$lbl), 
+    values = c("tomato","limegreen", "turquoise"), 
+    name="Gene") +
+  coord_equal() +
+  labs(title="Train: MCSA --> Test: ADNI") +
+  theme_bw(base_size = 7)
+p2 <- roc_a2m_4p %>% 
+  mutate(Gene = factor(Gene, levels = c("NDUFA9", "NDUFV1", "NDUFB8"))) %>% 
+  ggplot(aes(x = 1 - specificity, y = sensitivity, color=Gene)) +
+  geom_path() +
+  geom_abline(lty = 3) +
+  scale_color_manual(
+    labels = unique(roc_a2m_4p$lbl), 
+    values = c("tomato","limegreen", "turquoise"), 
+    name="Gene") +
+  coord_equal() +
+  labs(title="Train: ADNI --> Test: MCSA") +
+  theme_bw(base_size = 7)
+```
+
+```{r LMDR with CL}
+# Extract ROC data for plotting
+roc_m2a_4p_CL <- m2a_sep$Res_X.CL_Y.LMDR$NDUFA9$preds_all %>%
+  roc_curve(truth = truth, .pred_prob_gene) %>%
+  mutate(Gene = "NDUFA9", 
+         AUC = subset(m2a_sep$Res_X.CL_Y.LMDR$NDUFA9$metrics_all, .metric == "roc_auc")$.estimate_gene,
+         lbl = paste0(Gene, " (AUC = ", round(AUC,2), ")")) %>% 
+  rbind(
+    m2a_sep$Res_X.CL_Y.LMDR$NDUFV1$preds_all %>%
+      roc_curve(truth = truth, .pred_prob_gene) %>%
+      mutate(Gene = "NDUFV1", 
+             AUC = subset(m2a_sep$Res_X.CL_Y.LMDR$NDUFV1$metrics_all, .metric == "roc_auc")$.estimate_gene,
+             lbl = paste0(Gene, " (AUC = ", round(AUC,2), ")"))
+    ) %>% 
+  rbind(
+    m2a_sep$Res_X.CL_Y.LMDR$NDUFB8$preds_all %>%
+      roc_curve(truth = truth, .pred_prob_gene) %>%
+      mutate(Gene = "NDUFB8", 
+             AUC = subset(m2a_sep$Res_X.CL_Y.LMDR$NDUFB8$metrics_all, .metric == "roc_auc")$.estimate_gene,
+             lbl = paste0(Gene, " (AUC = ", round(AUC,2), ")"))
+  )
+roc_a2m_4p_CL <- a2m_sep$Res_X.CL_Y.LMDR$NDUFA9$preds_all %>%
+  roc_curve(truth = truth, .pred_prob_gene) %>%
+  mutate(Gene = "NDUFA9", 
+         AUC = subset(a2m_sep$Res_X.CL_Y.LMDR$NDUFA9$metrics_all, .metric == "roc_auc")$.estimate_gene,
+         lbl = paste0(Gene, " (AUC = ", round(AUC,2), ")")) %>% 
+  rbind(
+    a2m_sep$Res_X.CL_Y.LMDR$NDUFV1$preds_all %>%
+      roc_curve(truth = truth, .pred_prob_gene) %>%
+      mutate(Gene = "NDUFV1", 
+             AUC = subset(a2m_sep$Res_X.CL_Y.LMDR$NDUFV1$metrics_all, .metric == "roc_auc")$.estimate_gene,
+             lbl = paste0(Gene, " (AUC = ", round(AUC,2), ")"))
+  ) %>% 
+  rbind(
+    a2m_sep$Res_X.CL_Y.LMDR$NDUFB8$preds_all %>%
+      roc_curve(truth = truth, .pred_prob_gene) %>%
+      mutate(Gene = "NDUFB8", 
+             AUC = subset(a2m_sep$Res_X.CL_Y.LMDR$NDUFB8$metrics_all, .metric == "roc_auc")$.estimate_gene,
+             lbl = paste0(Gene, " (AUC = ", round(AUC,2), ")"))
+  )
+
+
+p3 <- roc_m2a_4p_CL %>% 
+  mutate(Gene = factor(Gene, levels = c("NDUFA9", "NDUFV1", "NDUFB8"))) %>% 
+  ggplot(aes(x = 1 - specificity, y = sensitivity, color=Gene)) +
+  geom_path() +
+  geom_abline(lty = 3) +
+  scale_color_manual(
+    labels = unique(roc_m2a_4p_CL$lbl), 
+    values = c("tomato","limegreen", "turquoise"), 
+    name="Gene") +
+  coord_equal() +
+  labs(title="Train: MCSA --> Test: ADNI") +
+  theme_bw(base_size = 7)
+p4 <- roc_a2m_4p_CL %>% 
+  mutate(Gene = factor(Gene, levels = c("NDUFA9", "NDUFV1", "NDUFB8"))) %>% 
+  ggplot(aes(x = 1 - specificity, y = sensitivity, color=Gene)) +
+  geom_path() +
+  geom_abline(lty = 3) +
+  scale_color_manual(
+    labels = unique(roc_a2m_4p_CL$lbl), 
+    values = c("tomato","limegreen", "turquoise"), 
+    name="Gene") +
+  coord_equal() +
+  labs(title="Train: ADNI --> Test: MCSA") +
+  theme_bw(base_size = 7)
+
+pdf(paste0(outdir, "/roc_curves.pdf"), width = 8, height = 8)
+(p1 + p2)/(p3 + p4)
+dev.off()
+```
+
+
+```{r}
+sessionInfo()
+```
+
+
+
